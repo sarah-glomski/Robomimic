@@ -1,5 +1,0 @@
-universal_manipulation_interface/runs/*
-dt_ag/models/*
-2d_strawberry_baseline/*
-*.pyc
-*.ckpt
