@@ -27,11 +27,11 @@ import pygame
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Bool, Float32
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Image
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 
@@ -45,13 +45,30 @@ class HDF5DataCollector(Node):
 
         self.get_logger().info('Initializing HDF5 Data Collector...')
 
+        # Object frame parameters (for HDF5 metadata)
+        self.declare_parameter('human_object_x', 0.30)
+        self.declare_parameter('human_object_y', 0.00)
+        self.declare_parameter('human_object_z', 0.10)
+        self.declare_parameter('robot_object_x', 0.35)
+        self.declare_parameter('robot_object_y', -0.15)
+        self.declare_parameter('robot_object_z', 0.10)
+        self.declare_parameter('use_object_relative', True)
+
         self._bridge = CvBridge()
 
-        # QoS for camera streams
+        # QoS for ROS topics (BEST_EFFORT for robot/hand topics)
         sensor_qos = QoSProfile(
             depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST
+        )
+
+        # QoS for RealSense camera (RELIABLE + TRANSIENT_LOCAL)
+        camera_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
 
         # Subscribers using message_filters for synchronization
@@ -71,15 +88,12 @@ class HDF5DataCollector(Node):
         self.hand_pose_sub = Subscriber(
             self, PoseStamped, 'hand/pose', qos_profile=sensor_qos)
 
-        # Camera images
+        # Camera image (using raw image with matching QoS)
         self.rs_front_sub = Subscriber(
-            self, CompressedImage, '/rs_front/rs_front/color/image_raw/compressed',
-            qos_profile=sensor_qos)
-        self.rs_hand_sub = Subscriber(
-            self, CompressedImage, '/rs_hand/rs_hand/color/image_raw/compressed',
-            qos_profile=sensor_qos)
+            self, Image, '/rs_front/rs_front/color/image_raw',
+            qos_profile=camera_qos)
 
-        # Approximate time synchronizer for all streams
+        # Approximate time synchronizer for all streams (without rs_hand for now)
         self.sync = ApproximateTimeSynchronizer(
             [
                 self.action_pose_sub,
@@ -88,7 +102,6 @@ class HDF5DataCollector(Node):
                 self.obs_gripper_sub,
                 self.hand_pose_sub,
                 self.rs_front_sub,
-                self.rs_hand_sub,
             ],
             queue_size=100,
             slop=0.1,
@@ -120,7 +133,6 @@ class HDF5DataCollector(Node):
         self.obs_gripper_buf = []
         self.hand_pose_buf = []
         self.rs_front_buf = []
-        self.rs_hand_buf = []
 
     def synced_callback(
         self,
@@ -129,8 +141,7 @@ class HDF5DataCollector(Node):
         obs_pose_msg: PoseStamped,
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
-        rs_front_msg: CompressedImage,
-        rs_hand_msg: CompressedImage
+        rs_front_msg: Image,
     ):
         """
         Synchronized callback for all data streams.
@@ -161,17 +172,16 @@ class HDF5DataCollector(Node):
             o = hand_pose_msg.pose.orientation
             self.hand_pose_buf.append([p.x, p.y, p.z, o.x, o.y, o.z, o.w])
 
-            # Camera images (CHW format)
+            # Camera image (CHW format)
             self.rs_front_buf.append(self.parse_color_image(rs_front_msg))
-            self.rs_hand_buf.append(self.parse_color_image(rs_hand_msg))
 
         frame_count = len(self.action_pose_buf)
         if frame_count % 30 == 0:
             self.get_logger().info(f'Collected {frame_count} frames')
 
-    def parse_color_image(self, msg: CompressedImage) -> np.ndarray:
-        """Convert compressed image to CHW RGB numpy array."""
-        bgr = self._bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+    def parse_color_image(self, msg: Image) -> np.ndarray:
+        """Convert raw image to CHW RGB numpy array."""
+        bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         return rgb.transpose(2, 0, 1)  # (3, H, W)
 
@@ -232,7 +242,6 @@ class HDF5DataCollector(Node):
             obs_gripper = np.array(self.obs_gripper_buf, dtype=np.float32)
             hand_pose = np.array(self.hand_pose_buf, dtype=np.float32)
             rs_front = np.array(self.rs_front_buf, dtype=np.uint8)
-            rs_hand = np.array(self.rs_hand_buf, dtype=np.uint8)
 
         # Create save directory
         save_dir = os.path.join(os.getcwd(), 'demo_data')
@@ -258,12 +267,22 @@ class HDF5DataCollector(Node):
             # Images with LZF compression
             images_grp = f.create_group('images')
             images_grp.create_dataset('rs_front', data=rs_front, compression='lzf')
-            images_grp.create_dataset('rs_hand', data=rs_hand, compression='lzf')
 
             # Metadata
             f.attrs['num_frames'] = len(action_pose)
             f.attrs['collection_rate_hz'] = 30
             f.attrs['episode_index'] = self.demo_count
+            f.attrs['use_object_relative'] = self.get_parameter('use_object_relative').value
+            f.attrs['human_object_position'] = [
+                self.get_parameter('human_object_x').value,
+                self.get_parameter('human_object_y').value,
+                self.get_parameter('human_object_z').value,
+            ]
+            f.attrs['robot_object_position'] = [
+                self.get_parameter('robot_object_x').value,
+                self.get_parameter('robot_object_y').value,
+                self.get_parameter('robot_object_z').value,
+            ]
 
         self.get_logger().info(f'Saved episode to {filename}')
 
