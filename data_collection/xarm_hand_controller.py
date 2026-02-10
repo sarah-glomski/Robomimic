@@ -228,6 +228,10 @@ class XArmHandController(Node):
         """
         Convert quaternion to euler angles and clamp within bounds.
 
+        The hand tracker publishes orientation as a quaternion in robot base frame.
+        We convert to the same euler convention the xArm uses (intrinsic xyz)
+        and clamp within bounds around the neutral orientation.
+
         Args:
             quat: Quaternion [x, y, z, w] from hand tracker
 
@@ -235,6 +239,7 @@ class XArmHandController(Node):
             Clamped euler angles [roll, pitch, yaw] in degrees
         """
         # Convert quaternion to euler angles (degrees)
+        # xArm uses intrinsic xyz: Rx(roll) * Ry(pitch) * Rz(yaw) around body axes
         rotation = R.from_quat([quat.x, quat.y, quat.z, quat.w])
         euler = rotation.as_euler('xyz', degrees=True)  # [roll, pitch, yaw]
 

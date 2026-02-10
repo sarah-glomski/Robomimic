@@ -270,8 +270,10 @@ class MediaPipeHandTracker(Node):
             self.tracking_active_pub.publish(status_msg)
 
             if tracking_active and hand_index is not None:
-                # Get matching hand landmarks
+                # Get matching hand landmarks (image coords for position/depth)
                 landmarks = results.multi_hand_landmarks[hand_index].landmark
+                # World landmarks (metric 3D coords for orientation)
+                world_landmarks = results.multi_hand_world_landmarks[hand_index].landmark
 
                 # Get palm center in 3D using depth
                 position_3d = self.get_palm_position_3d(landmarks, depth_image, img_w, img_h)
@@ -284,8 +286,8 @@ class MediaPipeHandTracker(Node):
                         self._filtered_position = (self._filter_alpha * position_3d +
                                                    (1.0 - self._filter_alpha) * self._filtered_position)
 
-                    # Get hand orientation from palm normal
-                    orientation = self.get_hand_orientation(landmarks, depth_image, img_w, img_h)
+                    # Get hand orientation from world landmarks (metric 3D)
+                    orientation = self.get_hand_orientation(world_landmarks)
 
                     # Publish hand pose with orientation
                     self.publish_hand_pose(self._filtered_position, orientation, color_msg.header.stamp)
@@ -427,95 +429,77 @@ class MediaPipeHandTracker(Node):
 
         return float(gripper)
 
-    def get_hand_orientation(self, landmarks, depth_image, img_w, img_h) -> np.ndarray:
+    def get_hand_orientation(self, world_landmarks) -> np.ndarray:
         """
-        Calculate hand orientation from landmarks using palm normal.
+        Calculate hand orientation from MediaPipe's world landmarks.
 
-        Uses wrist, index MCP, and pinky MCP to define palm plane.
+        Computes two key directions from the hand:
+        1. Palm normal (pointing out FRONT of palm, toward object to grasp)
+           -> maps to tool Z axis (approach direction)
+        2. Finger direction (wrist toward middle finger)
+           -> maps to tool X axis
+
+        Uses Rotation.align_vectors to find the rotation that maps
+        the tool's identity frame axes to these observed hand directions.
+
         Returns quaternion [x, y, z, w] in robot frame, or None if invalid.
         """
         try:
-            # Key landmarks for palm plane
-            # 0 = wrist, 5 = index MCP, 17 = pinky MCP
-            landmark_indices = [0, 5, 17]
-            points_3d = []
+            # Extract key landmarks in meters (MediaPipe camera frame)
+            wrist = np.array([world_landmarks[0].x, world_landmarks[0].y, world_landmarks[0].z])
+            index_mcp = np.array([world_landmarks[5].x, world_landmarks[5].y, world_landmarks[5].z])
+            pinky_mcp = np.array([world_landmarks[17].x, world_landmarks[17].y, world_landmarks[17].z])
+            middle_mcp = np.array([world_landmarks[9].x, world_landmarks[9].y, world_landmarks[9].z])
 
-            for idx in landmark_indices:
-                lm = landmarks[idx]
-                px = int(lm.x * img_w)
-                py = int(lm.y * img_h)
-                px = max(0, min(px, img_w - 1))
-                py = max(0, min(py, img_h - 1))
+            # Vectors on the palm plane
+            v_index = index_mcp - wrist
+            v_pinky = pinky_mcp - wrist
 
-                depth_mm = depth_image[py, px]
-                if depth_mm == 0:
-                    return None
+            # Palm normal in camera frame
+            palm_normal_cam = np.cross(v_index, v_pinky)
+            norm = np.linalg.norm(palm_normal_cam)
+            if norm < 1e-6:
+                return None
+            palm_normal_cam = palm_normal_cam / norm
 
-                depth_m = depth_mm / 1000.0
-                if depth_m < self._min_depth or depth_m > self._max_depth:
-                    return None
+            # Ensure palm normal points out FRONT of palm (toward camera = -Z in camera frame)
+            # MediaPipe camera frame: Z points into scene (away from camera)
+            # Palm front faces camera when hand is visible, so normal should have -Z component
+            if palm_normal_cam[2] > 0:
+                palm_normal_cam = -palm_normal_cam
 
-                # Convert to 3D camera frame
-                x_cam = (px - self._cx) * depth_m / self._fx
-                y_cam = (py - self._cy) * depth_m / self._fy
-                z_cam = depth_m
+            # Finger direction in camera frame (wrist → middle finger MCP)
+            finger_dir_cam = middle_mcp - wrist
+            finger_dir_cam = finger_dir_cam / (np.linalg.norm(finger_dir_cam) + 1e-8)
 
-                # Transform to robot frame
-                cam_point = np.array([x_cam, y_cam, z_cam])
-                robot_point = self._camera_rotation @ cam_point + self._camera_position
-                points_3d.append(robot_point)
+            # Transform both directions to robot frame
+            palm_normal_robot = self._cam_to_robot_rotation @ palm_normal_cam
+            finger_dir_robot = self._cam_to_robot_rotation @ finger_dir_cam
 
-            wrist = points_3d[0]
-            index_mcp = points_3d[1]
-            pinky_mcp = points_3d[2]
+            # Use align_vectors to find rotation from tool identity frame to hand directions
+            # At identity (roll=0, pitch=0, yaw=0): tool Z = [0,0,1], tool X = [1,0,0]
+            # We want: tool Z -> palm_normal (approach direction)
+            #          tool X -> finger_dir (reference direction)
+            target_vectors = np.array([palm_normal_robot, finger_dir_robot])
+            identity_axes = np.array([[0, 0, 1], [1, 0, 0]])  # Z and X of identity tool
 
-            # Vectors defining the palm
-            vec_wrist_to_index = index_mcp - wrist
-            vec_wrist_to_pinky = pinky_mcp - wrist
-
-            # Palm normal (perpendicular to palm, pointing out from back of hand)
-            palm_normal = np.cross(vec_wrist_to_pinky, vec_wrist_to_index)
-            palm_normal = palm_normal / (np.linalg.norm(palm_normal) + 1e-8)
-
-            # Hand "forward" direction (from wrist toward fingers)
-            hand_forward = (vec_wrist_to_index + vec_wrist_to_pinky) / 2
-            hand_forward = hand_forward / (np.linalg.norm(hand_forward) + 1e-8)
-
-            # Hand "right" direction (from index to pinky side)
-            hand_right = vec_wrist_to_pinky - vec_wrist_to_index
-            hand_right = hand_right / (np.linalg.norm(hand_right) + 1e-8)
-
-            # Re-orthogonalize: palm_normal is Z, hand_forward is Y, hand_right is X
-            # For gripper: Z points along approach direction (palm normal)
-            z_axis = -palm_normal  # Flip so it points same direction as palm faces
-            y_axis = hand_forward
-            # Recompute x_axis to ensure orthogonality
-            x_axis = np.cross(y_axis, z_axis)
-            x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-8)
-            # Recompute y_axis
-            y_axis = np.cross(z_axis, x_axis)
-
-            # Build rotation matrix (columns are axes)
-            rot_matrix = np.column_stack([x_axis, y_axis, z_axis])
-
-            # Convert to quaternion
-            rotation = R.from_matrix(rot_matrix)
+            rotation, _ = R.align_vectors(target_vectors, identity_axes)
             quat = rotation.as_quat()  # [x, y, z, w]
 
-            # Apply smoothing
+            # Smoothing with quaternion continuity
             if self._filtered_orientation is None:
                 self._filtered_orientation = quat
             else:
-                # Slerp-like smoothing (simple linear interpolation for now)
+                if np.dot(self._filtered_orientation, quat) < 0:
+                    quat = -quat
                 alpha = 0.3
                 self._filtered_orientation = alpha * quat + (1 - alpha) * self._filtered_orientation
-                # Renormalize
                 self._filtered_orientation = self._filtered_orientation / np.linalg.norm(self._filtered_orientation)
 
             return self._filtered_orientation
 
         except Exception as e:
-            self.get_logger().debug(f'Orientation calculation failed: {e}')
+            self.get_logger().warn(f'Orientation calculation failed: {e}')
             return None
 
     def publish_hand_pose(self, position: np.ndarray, orientation: np.ndarray, stamp):
