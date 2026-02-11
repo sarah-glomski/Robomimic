@@ -133,6 +133,7 @@ class HDF5DataCollector(Node):
         self.obs_gripper_buf = []
         self.hand_pose_buf = []
         self.rs_front_buf = []
+        self.elapsed_time_buf = []
 
     def synced_callback(
         self,
@@ -175,9 +176,24 @@ class HDF5DataCollector(Node):
             # Camera image (CHW format)
             self.rs_front_buf.append(self.parse_color_image(rs_front_msg))
 
+            # Elapsed time since episode start (seconds)
+            elapsed = (self.get_clock().now() - self.episode_start).nanoseconds / 1e9
+            self.elapsed_time_buf.append(elapsed)
+
         frame_count = len(self.action_pose_buf)
         if frame_count % 30 == 0:
-            self.get_logger().info(f'Collected {frame_count} frames')
+            ap = self.action_pose_buf[-1]
+            ag = self.action_gripper_buf[-1]
+            op = self.obs_pose_buf[-1]
+            og = self.obs_gripper_buf[-1]
+            hp = self.hand_pose_buf[-1]
+            et = self.elapsed_time_buf[-1]
+            self.get_logger().info(
+                f'Frame {frame_count} | t={et:.2f}s\n'
+                f'  action  pos=[{ap[0]:.3f}, {ap[1]:.3f}, {ap[2]:.3f}] grip={ag:.2f}\n'
+                f'  obs     pos=[{op[0]:.3f}, {op[1]:.3f}, {op[2]:.3f}] grip={og:.2f}\n'
+                f'  hand    pos=[{hp[0]:.3f}, {hp[1]:.3f}, {hp[2]:.3f}]'
+            )
 
     def parse_color_image(self, msg: Image) -> np.ndarray:
         """Convert raw image to CHW RGB numpy array."""
@@ -241,6 +257,7 @@ class HDF5DataCollector(Node):
             obs_pose = np.array(self.obs_pose_buf, dtype=np.float32)
             obs_gripper = np.array(self.obs_gripper_buf, dtype=np.float32)
             hand_pose = np.array(self.hand_pose_buf, dtype=np.float32)
+            elapsed_time = np.array(self.elapsed_time_buf, dtype=np.float32)
             rs_front = np.array(self.rs_front_buf, dtype=np.uint8)
 
         # Create save directory
@@ -263,6 +280,9 @@ class HDF5DataCollector(Node):
             # Hand tracking
             hand_grp = f.create_group('hand')
             hand_grp.create_dataset('pose', data=hand_pose)
+
+            # Elapsed time (seconds since episode start)
+            f.create_dataset('elapsed_time', data=elapsed_time)
 
             # Images with LZF compression
             images_grp = f.create_group('images')

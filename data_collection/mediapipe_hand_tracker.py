@@ -16,6 +16,7 @@ import os
 # Add parent directory to path for imports when run standalone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from collections import deque
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -42,6 +43,7 @@ class MediaPipeHandTracker(Node):
 
         # Parameters
         self.declare_parameter('filter_alpha', 0.3)
+        self.declare_parameter('orientation_filter_alpha', 0.12)
         self.declare_parameter('detection_confidence', 0.7)
         self.declare_parameter('tracking_confidence', 0.5)
         self.declare_parameter('depth_scale', 0.001)  # RealSense depth is in mm by default
@@ -51,8 +53,8 @@ class MediaPipeHandTracker(Node):
         # Camera position relative to robot base (meters)
         # Default: camera 0.8m in front of robot, 0.5m high, centered
         self.declare_parameter('camera_x', 0.8)   # Forward from robot base
-        self.declare_parameter('camera_y', 0.0)   # Left/right (0 = centered)
-        self.declare_parameter('camera_z', 0.5)   # Height above robot base
+        self.declare_parameter('camera_y', -0.125)   # Left/right (0 = centered)
+        self.declare_parameter('camera_z', 0.0)   # Height above robot base
 
         # Camera orientation: which way is the camera pointing?
         # 'towards_robot' = camera faces the robot (default for front-mounted)
@@ -61,7 +63,7 @@ class MediaPipeHandTracker(Node):
         self.declare_parameter('camera_orientation', 'towards_robot')
 
         # Which hand to track: 'left' or 'right'
-        self.declare_parameter('track_hand', 'left')
+        self.declare_parameter('track_hand', 'right')
 
         filter_alpha = self.get_parameter('filter_alpha').value
         detection_conf = self.get_parameter('detection_confidence').value
@@ -97,7 +99,9 @@ class MediaPipeHandTracker(Node):
 
         # Position filter for smoothing
         self._filter_alpha = filter_alpha
+        self._orientation_filter_alpha = self.get_parameter('orientation_filter_alpha').value
         self._filtered_position = None
+        self._position_window = deque(maxlen=5)  # Sliding window for median filtering
 
         # Camera intrinsics (will be set from CameraInfo)
         self._camera_info = None
@@ -315,6 +319,7 @@ class MediaPipeHandTracker(Node):
                     # Reset filters when tracking is lost
                     self._filtered_position = None
                     self._filtered_orientation = None
+                    self._position_window.clear()
 
             self._last_tracking_active = tracking_active
 
@@ -325,12 +330,15 @@ class MediaPipeHandTracker(Node):
         """
         Get palm center position in 3D camera frame using depth.
 
+        Averages wrist + 4 MCP joints for a stable palm center estimate.
+        A sliding window median filter rejects depth outliers before
+        the EMA smoothing.
+
         Returns position in robot frame (meters) or None if depth invalid.
         """
-        # Palm landmark indices
-        palm_indices = [0, 5, 9, 13, 17]  # wrist + 4 MCP joints
+        # Palm landmark indices: wrist + 4 MCP joints
+        palm_indices = [0, 5, 9, 13, 17]
 
-        # Collect pixel coordinates and depths
         pixel_coords = []
         depths = []
 
@@ -339,12 +347,10 @@ class MediaPipeHandTracker(Node):
             px = int(lm.x * img_w)
             py = int(lm.y * img_h)
 
-            # Clamp to image bounds
             px = max(0, min(px, img_w - 1))
             py = max(0, min(py, img_h - 1))
 
-            # Get depth value (sample 3x3 region for robustness)
-            depth_val = self.sample_depth(depth_image, px, py)
+            depth_val = self.sample_depth(depth_image, px, py, kernel_size=5)
             if depth_val is not None:
                 pixel_coords.append((px, py))
                 depths.append(depth_val)
@@ -367,8 +373,12 @@ class MediaPipeHandTracker(Node):
         point_cam = np.array([cam_x, cam_y, cam_z])
 
         # Transform to robot frame: rotate then translate
-        # point_robot = R @ point_cam + camera_position
         point_robot = self._cam_to_robot_rotation @ point_cam + self._camera_position
+
+        # Sliding window median filter to reject outlier frames
+        self._position_window.append(point_robot)
+        if len(self._position_window) >= 3:
+            point_robot = np.median(self._position_window, axis=0)
 
         return point_robot
 
@@ -448,8 +458,9 @@ class MediaPipeHandTracker(Node):
             # Extract key landmarks in meters (MediaPipe camera frame)
             wrist = np.array([world_landmarks[0].x, world_landmarks[0].y, world_landmarks[0].z])
             index_mcp = np.array([world_landmarks[5].x, world_landmarks[5].y, world_landmarks[5].z])
-            pinky_mcp = np.array([world_landmarks[17].x, world_landmarks[17].y, world_landmarks[17].z])
             middle_mcp = np.array([world_landmarks[9].x, world_landmarks[9].y, world_landmarks[9].z])
+            ring_mcp = np.array([world_landmarks[13].x, world_landmarks[13].y, world_landmarks[13].z])
+            pinky_mcp = np.array([world_landmarks[17].x, world_landmarks[17].y, world_landmarks[17].z])
 
             # Vectors on the palm plane
             v_index = index_mcp - wrist
@@ -462,14 +473,19 @@ class MediaPipeHandTracker(Node):
                 return None
             palm_normal_cam = palm_normal_cam / norm
 
-            # Ensure palm normal points out FRONT of palm (toward camera = -Z in camera frame)
-            # MediaPipe camera frame: Z points into scene (away from camera)
-            # Palm front faces camera when hand is visible, so normal should have -Z component
-            if palm_normal_cam[2] > 0:
+            # The cross product direction depends on hand chirality due to the
+            # spatial arrangement of index and pinky MCPs relative to the wrist:
+            #   LEFT hand:  cross(v_index, v_pinky) -> DORSAL (back of hand)
+            #   RIGHT hand: cross(v_index, v_pinky) -> PALMAR (front of palm)
+            # We always want the palmar direction (front of palm = grasp approach).
+            if self._track_hand == 'left':
                 palm_normal_cam = -palm_normal_cam
 
-            # Finger direction in camera frame (wrist → middle finger MCP)
-            finger_dir_cam = middle_mcp - wrist
+            # Finger direction: average all 4 finger MCPs to reduce per-landmark
+            # noise. A single MCP (e.g. middle) jitters by a few mm each frame;
+            # averaging 4 points cuts that noise by ~half (sqrt(4)).
+            avg_mcp = (index_mcp + middle_mcp + ring_mcp + pinky_mcp) / 4.0
+            finger_dir_cam = avg_mcp - wrist
             finger_dir_cam = finger_dir_cam / (np.linalg.norm(finger_dir_cam) + 1e-8)
 
             # Transform both directions to robot frame
@@ -480,10 +496,21 @@ class MediaPipeHandTracker(Node):
             # At identity (roll=0, pitch=0, yaw=0): tool Z = [0,0,1], tool X = [1,0,0]
             # We want: tool Z -> palm_normal (approach direction)
             #          tool X -> finger_dir (reference direction)
+            # Weight the palm normal 3x higher: it's geometrically stable (cross
+            # product of two long vectors) while finger direction is noisier and
+            # controls only the roll component.
             target_vectors = np.array([palm_normal_robot, finger_dir_robot])
             identity_axes = np.array([[0, 0, 1], [1, 0, 0]])  # Z and X of identity tool
+            weights = np.array([3.0, 1.0])
 
-            rotation, _ = R.align_vectors(target_vectors, identity_axes)
+            rotation, _ = R.align_vectors(target_vectors, identity_axes, weights=weights)
+
+            # Apply yaw offset around local tool Z axis to align gripper Y
+            # with the thumb-to-index finger closing direction
+            offset_deg = -45 if self._track_hand == 'right' else 45
+            yaw_offset = R.from_euler('z', offset_deg, degrees=True)
+            rotation = rotation * yaw_offset
+
             quat = rotation.as_quat()  # [x, y, z, w]
 
             # Smoothing with quaternion continuity
@@ -492,7 +519,7 @@ class MediaPipeHandTracker(Node):
             else:
                 if np.dot(self._filtered_orientation, quat) < 0:
                     quat = -quat
-                alpha = 0.3
+                alpha = self._orientation_filter_alpha
                 self._filtered_orientation = alpha * quat + (1 - alpha) * self._filtered_orientation
                 self._filtered_orientation = self._filtered_orientation / np.linalg.norm(self._filtered_orientation)
 

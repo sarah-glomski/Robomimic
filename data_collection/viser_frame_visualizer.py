@@ -78,8 +78,8 @@ class ViserFrameVisualizer(Node):
 
         # Camera position/orientation parameters
         self.declare_parameter('camera_x', 0.8)
-        self.declare_parameter('camera_y', 0.0)
-        self.declare_parameter('camera_z', 0.5)
+        self.declare_parameter('camera_y', -0.125)
+        self.declare_parameter('camera_z', 0.0)
         self.declare_parameter('camera_orientation', 'towards_robot')
 
         self.human_object_pos = (

@@ -47,7 +47,7 @@ class XArmHandController(Node):
         self.ip = self.declare_parameter('xarm_ip', '192.168.1.153').value
         self.control_rate = self.declare_parameter('control_rate', 30.0).value
         self.p_gain_pos = self.declare_parameter('p_gain_position', 5.0).value
-        self.max_linear_vel = self.declare_parameter('max_linear_velocity', 400.0).value  # mm/s
+        self.max_linear_vel = self.declare_parameter('max_linear_velocity', 250.0).value  # mm/s
 
         # Soft start mode - reduce speed for initial testing (0.0-1.0)
         self.soft_start_factor = self.declare_parameter('soft_start_factor', 1.0).value
@@ -60,14 +60,30 @@ class XArmHandController(Node):
         # Orientation bounds (degrees from neutral)
         self.roll_limit = self.declare_parameter('roll_limit_deg', 30.0).value
         self.pitch_limit = self.declare_parameter('pitch_limit_deg', 45.0).value
-        self.yaw_limit = self.declare_parameter('yaw_limit_deg', 90.0).value
+        self.yaw_limit = self.declare_parameter('yaw_limit_deg', 120.0).value
+
+        # Max orientation change per control step (degrees). At 30Hz, 3°/step = 90°/s.
+        self.max_orientation_delta = self.declare_parameter('max_orientation_delta_deg', 3.0).value
+
+        # Hardware-level joint safety limits (enforced by controller firmware)
+        self.reduced_max_joint_speed = self.declare_parameter('reduced_max_joint_speed_deg', 180.0).value  # deg/s
+        self.reduced_max_tcp_speed = self.declare_parameter('reduced_max_tcp_speed_mm', 250.0).value  # mm/s
+        self.joint_max_acc = self.declare_parameter('joint_max_acc_deg', 500.0).value  # deg/s^2
+        self.tcp_max_acc = self.declare_parameter('tcp_max_acc_mm', 2000.0).value  # mm/s^2
+
+        # Collision sensitivity: 0=disabled, 1-5=increasing sensitivity.
+        # During teleoperation, high sensitivity causes false collision triggers
+        # from fast wrist motion, which halts the arm mid-trajectory. The next
+        # command then arrives at a position far from where the arm stopped,
+        # causing S23 (large motor position deviation).
+        self.collision_sensitivity = self.declare_parameter('collision_sensitivity', 0).value
 
         # Object-relative frame parameters
-        self.declare_parameter('human_object_x', 0.30)
-        self.declare_parameter('human_object_y', 0.00)
+        self.declare_parameter('human_object_x', 0.25)
+        self.declare_parameter('human_object_y', -0.25)
         self.declare_parameter('human_object_z', 0.10)
-        self.declare_parameter('robot_object_x', 0.35)
-        self.declare_parameter('robot_object_y', -0.15)
+        self.declare_parameter('robot_object_x', 0.25)
+        self.declare_parameter('robot_object_y', 0.00)
         self.declare_parameter('robot_object_z', 0.10)
         self.declare_parameter('use_object_relative', True)
 
@@ -117,6 +133,7 @@ class XArmHandController(Node):
         self.is_resetting = False
         self.position_control_active = False
         self.hand_tracking_active = False
+        self._last_sent_orientation = None  # Last orientation sent to robot [roll, pitch, yaw] degrees
 
         # Subscribers for hand tracking input
         self.hand_pose_sub = self.create_subscription(
@@ -166,7 +183,30 @@ class XArmHandController(Node):
         self.arm.set_state(state=0)
         time.sleep(1)
 
-        self.get_logger().info('XArm initialized')
+        # Configure hardware-level safety limits enforced by the controller
+        # firmware. These prevent C24 (joint speed exceeds limit) and S23
+        # (large motor position deviation) errors that software-side delta
+        # limiting alone cannot catch — Mode 7's internal trajectory planner
+        # can still generate high joint velocities for some Cartesian moves.
+        code = self.arm.set_reduced_max_joint_speed(self.reduced_max_joint_speed, is_radian=False)
+        self.get_logger().info(f'Set reduced max joint speed: {self.reduced_max_joint_speed} deg/s (code={code})')
+
+        code = self.arm.set_reduced_max_tcp_speed(self.reduced_max_tcp_speed)
+        self.get_logger().info(f'Set reduced max TCP speed: {self.reduced_max_tcp_speed} mm/s (code={code})')
+
+        code = self.arm.set_reduced_mode(True)
+        self.get_logger().info(f'Enabled reduced mode (code={code})')
+
+        code = self.arm.set_joint_maxacc(self.joint_max_acc, is_radian=False)
+        self.get_logger().info(f'Set joint max acceleration: {self.joint_max_acc} deg/s^2 (code={code})')
+
+        code = self.arm.set_tcp_maxacc(self.tcp_max_acc)
+        self.get_logger().info(f'Set TCP max acceleration: {self.tcp_max_acc} mm/s^2 (code={code})')
+
+        code = self.arm.set_collision_sensitivity(self.collision_sensitivity)
+        self.get_logger().info(f'Set collision sensitivity: {self.collision_sensitivity} (code={code})')
+
+        self.get_logger().info('XArm initialized with safety limits')
 
     def initialize_gripper(self):
         """Initialize Lite6 gripper."""
@@ -239,22 +279,59 @@ class XArmHandController(Node):
             Clamped euler angles [roll, pitch, yaw] in degrees
         """
         # Convert quaternion to euler angles (degrees)
-        # xArm uses intrinsic xyz: Rx(roll) * Ry(pitch) * Rz(yaw) around body axes
+        # xArm uses RPY (extrinsic xyz): R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
         rotation = R.from_quat([quat.x, quat.y, quat.z, quat.w])
         euler = rotation.as_euler('xyz', degrees=True)  # [roll, pitch, yaw]
 
+        roll, pitch, yaw = euler[0], euler[1], euler[2]
+
+        # Normalize angles to be within ±180° of their neutral value before
+        # clamping. as_euler returns roll in [-180, 180], so a neutral of 180°
+        # sits right at the discontinuity: a tiny perturbation can flip the
+        # reported roll from +180° to -180°, which would then clamp to the
+        # lower bound instead of staying near neutral.
+        while roll - self.neutral_roll > 180.0:
+            roll -= 360.0
+        while roll - self.neutral_roll < -180.0:
+            roll += 360.0
+        while pitch - self.neutral_pitch > 180.0:
+            pitch -= 360.0
+        while pitch - self.neutral_pitch < -180.0:
+            pitch += 360.0
+        while yaw - self.neutral_yaw > 180.0:
+            yaw -= 360.0
+        while yaw - self.neutral_yaw < -180.0:
+            yaw += 360.0
+
         # Clamp within bounds around neutral orientation
-        roll = np.clip(euler[0],
-                       self.neutral_roll - self.roll_limit,
-                       self.neutral_roll + self.roll_limit)
-        pitch = np.clip(euler[1],
-                        self.neutral_pitch - self.pitch_limit,
-                        self.neutral_pitch + self.pitch_limit)
-        yaw = np.clip(euler[2],
+        raw_roll, raw_pitch, raw_yaw = roll, pitch, yaw
+
+        # Lock roll at neutral (180°) to reduce DOF for data collection
+        roll = self.neutral_roll
+        # Lock pitch at neutral (0°) so tool Z always points down
+        pitch = self.neutral_pitch
+        yaw = np.clip(yaw,
                       self.neutral_yaw - self.yaw_limit,
                       self.neutral_yaw + self.yaw_limit)
 
-        return np.array([roll, pitch, yaw])
+        # Only log yaw when it actually hits the clamp bounds
+        yaw_lower = self.neutral_yaw - self.yaw_limit
+        yaw_upper = self.neutral_yaw + self.yaw_limit
+        if raw_yaw < yaw_lower or raw_yaw > yaw_upper:
+            self.get_logger().info(f'CLIPPED yaw: {raw_yaw:.1f} -> {yaw:.1f} (bounds [{yaw_lower:.0f}, {yaw_upper:.0f}])')
+
+        clamped = np.array([roll, pitch, yaw])
+
+        # Limit per-step orientation change to prevent servo errors (S23).
+        # Without this, a large orientation jump commands huge wrist joint
+        # motion in one step, exceeding the motor's tracking capability.
+        if self._last_sent_orientation is not None:
+            delta = clamped - self._last_sent_orientation
+            delta = np.clip(delta, -self.max_orientation_delta, self.max_orientation_delta)
+            clamped = self._last_sent_orientation + delta
+
+        self._last_sent_orientation = clamped
+        return clamped
 
     def tracking_status_callback(self, msg: Bool):
         """Update hand tracking status."""
@@ -265,6 +342,7 @@ class XArmHandController(Node):
             # Hand tracking lost - stop robot
             self.target_position = None
             self.target_orientation = None
+            self._last_sent_orientation = None
             # In position mode, robot stops when no new commands are sent
 
     def hand_pose_callback(self, msg: PoseStamped):
@@ -405,6 +483,36 @@ class XArmHandController(Node):
         except Exception as e:
             pass  # Silently ignore errors in state publishing
 
+    def recover_from_error(self):
+        """
+        Attempt to recover from a controller error (C24, S23, etc.).
+
+        Clears the error, re-enables motion, and switches back to Mode 7.
+        Returns True if recovery succeeded.
+        """
+        self.get_logger().warn(f'Recovering from error code: C{self.arm.error_code}')
+        try:
+            self.arm.clean_error()
+            self.arm.clean_warn()
+            self.arm.motion_enable(enable=True)
+            self.arm.set_mode(0)
+            self.arm.set_state(0)
+            time.sleep(0.5)
+
+            # Re-enter Mode 7 for real-time control
+            self.position_control_active = False
+            self.switch_to_online_trajectory_mode()
+
+            if self.arm.error_code == 0:
+                self.get_logger().info('Error recovery successful')
+                return True
+            else:
+                self.get_logger().error(f'Recovery failed, error code still: C{self.arm.error_code}')
+                return False
+        except Exception as e:
+            self.get_logger().error(f'Exception during recovery: {e}')
+            return False
+
     def control_loop(self):
         """
         Main control loop - streams position commands using online trajectory mode.
@@ -413,6 +521,13 @@ class XArmHandController(Node):
         if (self.is_paused or self.is_resetting or
             self.target_position is None or not self.position_control_active):
             return
+
+        # Check for controller errors (C24: joint speed exceeds limit, etc.)
+        # and attempt auto-recovery so the session isn't bricked.
+        if self.arm.error_code != 0:
+            self.get_logger().warn(f'Controller error C{self.arm.error_code} detected, attempting recovery...')
+            if not self.recover_from_error():
+                return
 
         try:
             # Target position in mm
@@ -462,6 +577,7 @@ class XArmHandController(Node):
             self.is_resetting = True
             self.target_position = None
             self.target_orientation = None
+            self._last_sent_orientation = None
 
             # Reset safety limit tracking
             self._safety.reset_tracking()

@@ -44,11 +44,11 @@ def generate_launch_description():
     # Edit these to match your physical object positions
     obj_params = [
         '--ros-args',
-        '-p', 'human_object_x:=0.30',
-        '-p', 'human_object_y:=-0.20',
+        '-p', 'human_object_x:=0.25',
+        '-p', 'human_object_y:=-0.25',
         '-p', 'human_object_z:=0.10',
         '-p', 'robot_object_x:=0.25',
-        '-p', 'robot_object_y:=0.05',
+        '-p', 'robot_object_y:=0.00',
         '-p', 'robot_object_z:=0.10',
         '-p', 'use_object_relative:=true',
     ]
