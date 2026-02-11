@@ -22,7 +22,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Float32MultiArray, Bool, Float32
+from std_msgs.msg import Float32MultiArray, Bool
 
 
 # MediaPipe hand landmark names
@@ -68,37 +68,6 @@ class ViserFrameVisualizer(Node):
         self.declare_parameter('workspace_z_min', 0.05)
         self.declare_parameter('workspace_z_max', 0.4)
 
-        # Object frame parameters
-        self.declare_parameter('human_object_x', 0.30)
-        self.declare_parameter('human_object_y', 0.00)
-        self.declare_parameter('human_object_z', 0.10)
-        self.declare_parameter('robot_object_x', 0.35)
-        self.declare_parameter('robot_object_y', -0.15)
-        self.declare_parameter('robot_object_z', 0.10)
-
-        # Camera position/orientation parameters
-        self.declare_parameter('camera_x', 0.8)
-        self.declare_parameter('camera_y', -0.125)
-        self.declare_parameter('camera_z', 0.0)
-        self.declare_parameter('camera_orientation', 'towards_robot')
-
-        self.human_object_pos = (
-            self.get_parameter('human_object_x').value,
-            self.get_parameter('human_object_y').value,
-            self.get_parameter('human_object_z').value,
-        )
-        self.robot_object_pos = (
-            self.get_parameter('robot_object_x').value,
-            self.get_parameter('robot_object_y').value,
-            self.get_parameter('robot_object_z').value,
-        )
-        self.camera_pos = (
-            self.get_parameter('camera_x').value,
-            self.get_parameter('camera_y').value,
-            self.get_parameter('camera_z').value,
-        )
-        self.camera_orientation = self.get_parameter('camera_orientation').value
-
         viser_port = self.get_parameter('viser_port').value
         self.workspace_bounds = {
             'x_min': self.get_parameter('workspace_x_min').value,
@@ -126,10 +95,6 @@ class ViserFrameVisualizer(Node):
         # Subscribers
         self.robot_pose_sub = self.create_subscription(
             PoseStamped, 'robot_obs/pose', self.robot_pose_callback, sensor_qos)
-        self.robot_action_sub = self.create_subscription(
-            PoseStamped, 'robot_action/pose', self.robot_action_callback, sensor_qos)
-        self.robot_gripper_sub = self.create_subscription(
-            Float32, 'robot_obs/gripper', self.gripper_callback, sensor_qos)
         self.hand_pose_sub = self.create_subscription(
             PoseStamped, 'hand/pose', self.hand_pose_callback, sensor_qos)
         self.landmarks_sub = self.create_subscription(
@@ -140,8 +105,6 @@ class ViserFrameVisualizer(Node):
         # State
         self._hand_tracking_active = False
         self._landmarks = None
-        self._robot_position = np.array([0.2, 0.0, 0.2])
-        self._gripper_value = 0.0
 
         self.get_logger().info(f'Viser Frame Visualizer initialized')
         self.get_logger().info(f'Open browser to: http://localhost:{viser_port}')
@@ -178,36 +141,6 @@ class ViserFrameVisualizer(Node):
             visible=False,
         )
 
-        # Robot target position marker (transparent red sphere)
-        self.robot_target_marker = self.server.scene.add_icosphere(
-            "/robot_target",
-            radius=0.015,
-            color=(255, 100, 100),
-            position=(0.2, 0.0, 0.2),
-        )
-
-        # Simple robot arm visualization (line from base to EEF)
-        self._arm_line_handle = self.server.scene.add_line_segments(
-            "/robot_arm",
-            points=np.array([[[0.0, 0.0, 0.0], [0.2, 0.0, 0.2]]], dtype=np.float32),
-            colors=np.array([[[100, 180, 100], [100, 180, 100]]], dtype=np.uint8),
-            line_width=4.0,
-        )
-
-        # Gripper visualization (two small boxes)
-        self._gripper_left = self.server.scene.add_box(
-            "/robot_gripper_left",
-            dimensions=(0.01, 0.01, 0.03),
-            color=(80, 80, 80),
-            position=(0.2, 0.015, 0.2),
-        )
-        self._gripper_right = self.server.scene.add_box(
-            "/robot_gripper_right",
-            dimensions=(0.01, 0.01, 0.03),
-            color=(80, 80, 80),
-            position=(0.2, -0.015, 0.2),
-        )
-
         # Workspace bounds wireframe
         self.add_workspace_bounds()
 
@@ -222,145 +155,9 @@ class ViserFrameVisualizer(Node):
             position=(0.3, 0.0, 0.0),
         )
 
-        # Human object reference frame (orange)
-        self.human_object_frame_viz = self.server.scene.add_frame(
-            "/human_object_frame",
-            wxyz=(1.0, 0.0, 0.0, 0.0),
-            position=self.human_object_pos,
-            axes_length=0.06,
-            axes_radius=0.003,
-            origin_color=(255, 165, 0),
-        )
-        self.server.scene.add_box(
-            "/human_object_box",
-            dimensions=(0.04, 0.04, 0.04),
-            color=(255, 165, 0),
-            position=self.human_object_pos,
-        )
-        self.server.scene.add_label(
-            "/human_object_label",
-            text="Human Object",
-            position=(self.human_object_pos[0], self.human_object_pos[1],
-                      self.human_object_pos[2] + 0.05),
-        )
-
-        # Robot object reference frame (cyan)
-        self.robot_object_frame_viz = self.server.scene.add_frame(
-            "/robot_object_frame",
-            wxyz=(1.0, 0.0, 0.0, 0.0),
-            position=self.robot_object_pos,
-            axes_length=0.06,
-            axes_radius=0.003,
-            origin_color=(0, 200, 200),
-        )
-        self.server.scene.add_box(
-            "/robot_object_box",
-            dimensions=(0.04, 0.04, 0.04),
-            color=(0, 200, 200),
-            position=self.robot_object_pos,
-        )
-        self.server.scene.add_label(
-            "/robot_object_label",
-            text="Robot Object",
-            position=(self.robot_object_pos[0], self.robot_object_pos[1],
-                      self.robot_object_pos[2] + 0.05),
-        )
-
         # Initialize hand landmarks point cloud (will be updated)
         self._hand_points_handle = None
         self._hand_skeleton_handle = None
-
-        # Camera frame visualization (purple)
-        self.add_camera_frame()
-
-    def add_camera_frame(self):
-        """Add camera position and orientation visualization."""
-        # Get camera orientation quaternion
-        camera_wxyz = self._get_camera_quaternion()
-
-        # Camera frame (purple)
-        self.camera_frame = self.server.scene.add_frame(
-            "/camera_frame",
-            wxyz=camera_wxyz,
-            position=self.camera_pos,
-            axes_length=0.08,
-            axes_radius=0.004,
-            origin_color=(150, 50, 200),
-        )
-
-        # Camera body (small box to represent camera)
-        self.server.scene.add_box(
-            "/camera_body",
-            dimensions=(0.04, 0.08, 0.03),
-            color=(100, 100, 100),
-            position=self.camera_pos,
-            wxyz=camera_wxyz,
-        )
-
-        # Camera lens (small cylinder facing forward)
-        # We'll use a small sphere to indicate the lens direction
-        lens_offset = self._get_camera_forward_vector() * 0.03
-        lens_pos = (
-            self.camera_pos[0] + lens_offset[0],
-            self.camera_pos[1] + lens_offset[1],
-            self.camera_pos[2] + lens_offset[2],
-        )
-        self.server.scene.add_icosphere(
-            "/camera_lens",
-            radius=0.01,
-            color=(50, 50, 50),
-            position=lens_pos,
-        )
-
-        # Camera label
-        self.server.scene.add_label(
-            "/camera_label",
-            text="Camera",
-            position=(self.camera_pos[0], self.camera_pos[1], self.camera_pos[2] + 0.08),
-        )
-
-        # Camera view direction line (show where camera is pointing)
-        view_length = 0.3
-        view_end = self._get_camera_forward_vector() * view_length
-        view_points = np.array([[
-            [self.camera_pos[0], self.camera_pos[1], self.camera_pos[2]],
-            [self.camera_pos[0] + view_end[0], self.camera_pos[1] + view_end[1], self.camera_pos[2] + view_end[2]]
-        ]], dtype=np.float32)
-        view_colors = np.array([[[150, 50, 200], [150, 50, 200]]], dtype=np.uint8)
-
-        self.server.scene.add_line_segments(
-            "/camera_view_direction",
-            points=view_points,
-            colors=view_colors,
-            line_width=2.0,
-        )
-
-    def _get_camera_quaternion(self):
-        """Get quaternion (wxyz) for camera orientation."""
-        if self.camera_orientation == 'towards_robot':
-            # Camera faces -X direction (towards robot at origin)
-            # Rotate 180 degrees around Z axis
-            return (0.0, 0.0, 0.0, 1.0)  # 180 deg around Z
-        elif self.camera_orientation == 'away_from_robot':
-            # Camera faces +X direction
-            return (1.0, 0.0, 0.0, 0.0)  # Identity
-        elif self.camera_orientation == 'down':
-            # Camera faces -Z direction (looking down)
-            # Rotate -90 degrees around Y axis
-            return (0.707, 0.0, -0.707, 0.0)
-        else:
-            return (1.0, 0.0, 0.0, 0.0)
-
-    def _get_camera_forward_vector(self):
-        """Get unit vector pointing in camera's forward direction."""
-        if self.camera_orientation == 'towards_robot':
-            return np.array([-1.0, 0.0, 0.0])
-        elif self.camera_orientation == 'away_from_robot':
-            return np.array([1.0, 0.0, 0.0])
-        elif self.camera_orientation == 'down':
-            return np.array([0.0, 0.0, -1.0])
-        else:
-            return np.array([-1.0, 0.0, 0.0])
 
     def add_workspace_bounds(self):
         """Add wireframe box showing workspace safety bounds."""
@@ -407,28 +204,8 @@ class ViserFrameVisualizer(Node):
         pos = msg.pose.position
         ori = msg.pose.orientation
 
-        self._robot_position = np.array([pos.x, pos.y, pos.z])
-
         self.robot_eef_frame.position = (pos.x, pos.y, pos.z)
         self.robot_eef_frame.wxyz = (ori.w, ori.x, ori.y, ori.z)
-
-        # Update arm line from base to EEF
-        arm_points = np.array([[[0.0, 0.0, 0.0], [pos.x, pos.y, pos.z]]], dtype=np.float32)
-        self._arm_line_handle.points = arm_points
-
-        # Update gripper positions (attached to EEF)
-        gripper_offset = 0.015 + 0.015 * (1.0 - self._gripper_value)  # Open/close
-        self._gripper_left.position = (pos.x, pos.y + gripper_offset, pos.z)
-        self._gripper_right.position = (pos.x, pos.y - gripper_offset, pos.z)
-
-    def robot_action_callback(self, msg: PoseStamped):
-        """Update robot target marker (commanded position)."""
-        pos = msg.pose.position
-        self.robot_target_marker.position = (pos.x, pos.y, pos.z)
-
-    def gripper_callback(self, msg: Float32):
-        """Update gripper value."""
-        self._gripper_value = msg.data
 
     def hand_pose_callback(self, msg: PoseStamped):
         """Update hand palm frame position."""
