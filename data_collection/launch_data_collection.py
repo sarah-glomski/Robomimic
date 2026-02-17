@@ -79,7 +79,7 @@ def generate_launch_description():
             namespace='rs_front',
             output='screen',
             parameters=[{
-                'serial_no': '903223051695',
+                'serial_no': '317222072257',
                 'camera_name': 'rs_front',
                 'enable_color': True,
                 'enable_depth': False,

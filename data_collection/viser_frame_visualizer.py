@@ -207,8 +207,9 @@ class ViserFrameVisualizer(Node):
         cam_fov = 0.733   # ~42 deg vertical FOV (RealSense D435)
         cam_aspect = 640.0 / 360.0
 
-        # Head camera: overhead at (0.3, 0, 0.8), looking straight down (-Z)
-        # 180-deg rotation about X axis -> quaternion wxyz = (0, 1, 0, 0)
+        # Head camera: overhead, rotated -45 deg about Z from (0.3, 0, 0.8)
+        # Base: 180-deg about X (down-facing), then -45 deg about Z
+        # quaternion wxyz = (0, 0.9239, -0.3827, 0)
         self.server.scene.add_camera_frustum(
             "/cameras/head",
             fov=cam_fov,
@@ -216,17 +217,17 @@ class ViserFrameVisualizer(Node):
             scale=0.08,
             line_width=2.0,
             color=(100, 180, 255),
-            wxyz=(0.0, 1.0, 0.0, 0.0),
-            position=(0.3, 0.0, 0.8),
+            wxyz=(0.0, 0.7071, 0.7071, 0.0),
+            position=(0.28, 0.0, 1.02),
         )
         self.server.scene.add_label(
             "/cameras/head/label",
             text="Head Cam",
         )
 
-        # Front camera: at (-0.1, 0, 0.5), angled 45 deg below horizon toward +X
-        # cam_z = [0.707, 0, -0.707], cam_x = [0, -1, 0]
-        # quaternion wxyz = (0.2706, -0.6533, 0.6533, -0.2706)
+        # Front camera: flipped 180 deg about Z to opposite side of workspace,
+        # facing toward robot base, angled 45 deg below horizon toward -X
+        # quaternion wxyz = (0.2706, -0.6533, -0.6533, 0.2706)
         self.server.scene.add_camera_frustum(
             "/cameras/front",
             fov=cam_fov,
@@ -234,8 +235,8 @@ class ViserFrameVisualizer(Node):
             scale=0.08,
             line_width=2.0,
             color=(255, 180, 100),
-            wxyz=(0.2706, -0.6533, 0.6533, -0.2706),
-            position=(-0.1, 0.0, 0.5),
+            wxyz=(0.2706, -0.6533, -0.6533, 0.2706),
+            position=(1.125, 0.0, 0.7),
         )
         self.server.scene.add_label(
             "/cameras/front/label",
