@@ -155,6 +155,9 @@ class ViserFrameVisualizer(Node):
             position=(0.3, 0.0, 0.0),
         )
 
+        # Camera frustums
+        self.add_camera_frustums()
+
         # Initialize hand landmarks point cloud (will be updated)
         self._hand_points_handle = None
         self._hand_skeleton_handle = None
@@ -197,6 +200,46 @@ class ViserFrameVisualizer(Node):
             points=points.astype(np.float32),
             colors=colors.astype(np.uint8),
             line_width=2.0,
+        )
+
+    def add_camera_frustums(self):
+        """Add camera frustum visualizations for head and front cameras."""
+        cam_fov = 0.733   # ~42 deg vertical FOV (RealSense D435)
+        cam_aspect = 640.0 / 360.0
+
+        # Head camera: overhead at (0.3, 0, 0.8), looking straight down (-Z)
+        # 180-deg rotation about X axis -> quaternion wxyz = (0, 1, 0, 0)
+        self.server.scene.add_camera_frustum(
+            "/cameras/head",
+            fov=cam_fov,
+            aspect=cam_aspect,
+            scale=0.08,
+            line_width=2.0,
+            color=(100, 180, 255),
+            wxyz=(0.0, 1.0, 0.0, 0.0),
+            position=(0.3, 0.0, 0.8),
+        )
+        self.server.scene.add_label(
+            "/cameras/head/label",
+            text="Head Cam",
+        )
+
+        # Front camera: at (-0.1, 0, 0.5), angled 45 deg below horizon toward +X
+        # cam_z = [0.707, 0, -0.707], cam_x = [0, -1, 0]
+        # quaternion wxyz = (0.2706, -0.6533, 0.6533, -0.2706)
+        self.server.scene.add_camera_frustum(
+            "/cameras/front",
+            fov=cam_fov,
+            aspect=cam_aspect,
+            scale=0.08,
+            line_width=2.0,
+            color=(255, 180, 100),
+            wxyz=(0.2706, -0.6533, 0.6533, -0.2706),
+            position=(-0.1, 0.0, 0.5),
+        )
+        self.server.scene.add_label(
+            "/cameras/front/label",
+            text="Front Cam",
         )
 
     def robot_pose_callback(self, msg: PoseStamped):
