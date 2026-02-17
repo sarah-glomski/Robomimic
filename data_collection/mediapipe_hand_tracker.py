@@ -79,10 +79,10 @@ class MediaPipeHandTracker(Node):
             history=HistoryPolicy.KEEP_LAST
         )
 
-        # Subscribe to hand tracking camera (one of the RealSenses)
+        # Subscribe to head camera for hand tracking
         self.image_sub = self.create_subscription(
             CompressedImage,
-            '/rs_hand/rs_hand/color/image_raw/compressed',
+            '/rs_head/rs_head/color/image_raw/compressed',
             self.image_callback,
             sensor_qos
         )

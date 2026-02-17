@@ -6,7 +6,7 @@ Collects time-synchronized data from multiple sources and saves to HDF5:
 - Robot actions (target pose, gripper command)
 - Robot observations (current pose, gripper state)
 - Hand tracking data
-- Camera images (2 RealSense cameras)
+- Camera images (3 RealSense cameras: front, wrist, head)
 
 Uses pygame for keyboard control:
 - r: Reset robot to home position
@@ -75,8 +75,11 @@ class HDF5DataCollector(Node):
         self.rs_front_sub = Subscriber(
             self, CompressedImage, '/rs_front/rs_front/color/image_raw/compressed',
             qos_profile=sensor_qos)
-        self.rs_hand_sub = Subscriber(
-            self, CompressedImage, '/rs_hand/rs_hand/color/image_raw/compressed',
+        self.rs_wrist_sub = Subscriber(
+            self, CompressedImage, '/rs_wrist/rs_wrist/color/image_raw/compressed',
+            qos_profile=sensor_qos)
+        self.rs_head_sub = Subscriber(
+            self, CompressedImage, '/rs_head/rs_head/color/image_raw/compressed',
             qos_profile=sensor_qos)
 
         # Approximate time synchronizer for all streams
@@ -88,7 +91,8 @@ class HDF5DataCollector(Node):
                 self.obs_gripper_sub,
                 self.hand_pose_sub,
                 self.rs_front_sub,
-                self.rs_hand_sub,
+                self.rs_wrist_sub,
+                self.rs_head_sub,
             ],
             queue_size=100,
             slop=0.1,
@@ -120,7 +124,8 @@ class HDF5DataCollector(Node):
         self.obs_gripper_buf = []
         self.hand_pose_buf = []
         self.rs_front_buf = []
-        self.rs_hand_buf = []
+        self.rs_wrist_buf = []
+        self.rs_head_buf = []
 
     def synced_callback(
         self,
@@ -130,7 +135,8 @@ class HDF5DataCollector(Node):
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
         rs_front_msg: CompressedImage,
-        rs_hand_msg: CompressedImage
+        rs_wrist_msg: CompressedImage,
+        rs_head_msg: CompressedImage
     ):
         """
         Synchronized callback for all data streams.
@@ -163,7 +169,8 @@ class HDF5DataCollector(Node):
 
             # Camera images (CHW format)
             self.rs_front_buf.append(self.parse_color_image(rs_front_msg))
-            self.rs_hand_buf.append(self.parse_color_image(rs_hand_msg))
+            self.rs_wrist_buf.append(self.parse_color_image(rs_wrist_msg))
+            self.rs_head_buf.append(self.parse_color_image(rs_head_msg))
 
         frame_count = len(self.action_pose_buf)
         if frame_count % 30 == 0:
@@ -232,7 +239,8 @@ class HDF5DataCollector(Node):
             obs_gripper = np.array(self.obs_gripper_buf, dtype=np.float32)
             hand_pose = np.array(self.hand_pose_buf, dtype=np.float32)
             rs_front = np.array(self.rs_front_buf, dtype=np.uint8)
-            rs_hand = np.array(self.rs_hand_buf, dtype=np.uint8)
+            rs_wrist = np.array(self.rs_wrist_buf, dtype=np.uint8)
+            rs_head = np.array(self.rs_head_buf, dtype=np.uint8)
 
         # Create save directory
         save_dir = os.path.join(os.getcwd(), 'demo_data')
@@ -258,7 +266,8 @@ class HDF5DataCollector(Node):
             # Images with LZF compression
             images_grp = f.create_group('images')
             images_grp.create_dataset('rs_front', data=rs_front, compression='lzf')
-            images_grp.create_dataset('rs_hand', data=rs_hand, compression='lzf')
+            images_grp.create_dataset('rs_wrist', data=rs_wrist, compression='lzf')
+            images_grp.create_dataset('rs_head', data=rs_head, compression='lzf')
 
             # Metadata
             f.attrs['num_frames'] = len(action_pose)

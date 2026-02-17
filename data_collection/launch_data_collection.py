@@ -3,7 +3,7 @@
 Launch file for MediaPipe Hand Tracking Data Collection System
 
 Launches:
-- 2 RealSense cameras (rs_front for observation, rs_hand for hand tracking)
+- 3 RealSense cameras (rs_front, rs_wrist, rs_head)
 - xarm_state_publisher: Publishes robot state
 - mediapipe_hand_tracker: Detects hand and publishes pose
 - xarm_hand_controller: Controls robot based on hand tracking
@@ -71,8 +71,7 @@ def generate_launch_description():
             output='screen'
         ),
 
-        # RealSense Camera 1: Front view (observation only)
-        # UPDATE: Replace serial_no with your camera's serial number
+        # RealSense Camera 1: Front view (observation)
         Node(
             package='realsense2_camera',
             executable='realsense2_camera_node',
@@ -80,7 +79,7 @@ def generate_launch_description():
             namespace='rs_front',
             output='screen',
             parameters=[{
-                'serial_no': '845112071112',  # Updated
+                'serial_no': '903223051695',
                 'camera_name': 'rs_front',
                 'enable_color': True,
                 'enable_depth': False,
@@ -92,26 +91,45 @@ def generate_launch_description():
             }]
         ),
 
-        # RealSense Camera 2: Hand tracking camera
-        # UPDATE: Replace serial_no with your camera's serial number
-        # Node(
-        #     package='realsense2_camera',
-        #     executable='realsense2_camera_node',
-        #     name='rs_hand',
-        #     namespace='rs_hand',
-        #     output='screen',
-        #     parameters=[{
-        #         'serial_no': 'YOUR_HAND_CAMERA_SERIAL',  # TODO: Update this
-        #         'camera_name': 'rs_hand',
-        #         'enable_color': True,
-        #         'enable_depth': False,
-        #         'enable_infra1': False,
-        #         'enable_infra2': False,
-        #         'enable_gyro': False,
-        #         'enable_accel': False,
-        #         'rgb_camera.color_profile': '640x360x30',
-        #     }]
-        # ),
+        # RealSense Camera 2: Wrist-mounted camera
+        Node(
+            package='realsense2_camera',
+            executable='realsense2_camera_node',
+            name='rs_wrist',
+            namespace='rs_wrist',
+            output='screen',
+            parameters=[{
+                'serial_no': '327743061097',
+                'camera_name': 'rs_wrist',
+                'enable_color': True,
+                'enable_depth': False,
+                'enable_infra1': False,
+                'enable_infra2': False,
+                'enable_gyro': False,
+                'enable_accel': False,
+                'rgb_camera.color_profile': '640x360x30',
+            }]
+        ),
+
+        # RealSense Camera 3: Head-mounted camera (used for hand tracking)
+        Node(
+            package='realsense2_camera',
+            executable='realsense2_camera_node',
+            name='rs_head',
+            namespace='rs_head',
+            output='screen',
+            parameters=[{
+                'serial_no': '845112071112',
+                'camera_name': 'rs_head',
+                'enable_color': True,
+                'enable_depth': False,
+                'enable_infra1': False,
+                'enable_infra2': False,
+                'enable_gyro': False,
+                'enable_accel': False,
+                'rgb_camera.color_profile': '640x360x30',
+            }]
+        ),
     ])
 
 
@@ -121,7 +139,7 @@ def main(argv=sys.argv[1:]):
     print("MediaPipe Hand Tracking Data Collection System")
     print("=" * 60)
     print()
-    print("IMPORTANT: Update RealSense serial numbers in this file!")
+    print("IMPORTANT: Update RealSense serial numbers (front, wrist, head) in this file!")
     print("Find serial numbers with: rs-enumerate-devices | grep Serial")
     print()
     print("Keyboard Controls (in pygame window):")

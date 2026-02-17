@@ -31,7 +31,7 @@ class XArmHandController(Node):
         super().__init__('xarm_hand_controller')
 
         # Declare parameters
-        self.ip = self.declare_parameter('xarm_ip', '192.168.1.213').value
+        self.ip = self.declare_parameter('xarm_ip', '192.168.1.219').value
         self.control_rate = self.declare_parameter('control_rate', 30.0).value
         self.p_gain_pos = self.declare_parameter('p_gain_position', 5.0).value
         self.max_linear_vel = self.declare_parameter('max_linear_velocity', 100.0).value  # mm/s
@@ -92,12 +92,31 @@ class XArmHandController(Node):
                               f'Y[{self.y_min}, {self.y_max}], Z[{self.z_min}, {self.z_max}]')
 
     def setup_xarm(self):
-        """Initialize XArm for control."""
+        """Initialize XArm for control with safety limits."""
+        self.arm.clean_error()
+        self.arm.clean_warn()
         self.arm.motion_enable(enable=True)
         self.arm.set_mode(0)  # Start in position mode
         self.arm.set_state(state=0)
         time.sleep(1)
-        self.get_logger().info('XArm initialized')
+
+        # Hardware-level safety boundaries (mm)
+        # Format: [x_max, x_min, y_max, y_min, z_max, z_min]
+        self.arm.set_reduced_tcp_boundary([
+            self.x_max * 1000, self.x_min * 1000,
+            self.y_max * 1000, self.y_min * 1000,
+            self.z_max * 1000, self.z_min * 1000,
+        ])
+        self.arm.set_fense_mode(True)
+
+        # Conservative acceleration limits for teleoperation
+        self.arm.set_tcp_maxacc(5000)           # mm/s^2
+        self.arm.set_joint_maxacc(10)           # rad/s^2
+        self.arm.set_reduced_max_tcp_speed(200) # mm/s
+        self.arm.set_reduced_max_joint_speed(60) # deg/s
+        self.arm.set_reduced_mode(True)
+
+        self.get_logger().info('XArm initialized with safety limits')
 
     def initialize_gripper(self):
         """Initialize gripper settings."""
