@@ -31,7 +31,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Bool, Float32
 from geometry_msgs.msg import PoseStamped
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import Image
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from cv_bridge import CvBridge
 
@@ -44,6 +44,10 @@ class HDF5DataCollector(Node):
         super().__init__('hdf5_data_collector')
 
         self.get_logger().info('Initializing HDF5 Data Collector...')
+
+        # Latency offset metadata (mirrors controller's parameter)
+        self.declare_parameter('latency_offset', 0.0)
+        self._latency_offset = self.get_parameter('latency_offset').value
 
         self._bridge = CvBridge()
 
@@ -71,15 +75,15 @@ class HDF5DataCollector(Node):
         self.hand_pose_sub = Subscriber(
             self, PoseStamped, 'hand/pose', qos_profile=sensor_qos)
 
-        # Camera images
+        # Camera images (raw Image for reliability with enable_sync mode)
         self.rs_front_sub = Subscriber(
-            self, CompressedImage, '/rs_front/rs_front/color/image_raw/compressed',
+            self, Image, '/rs_front/rs_front/color/image_raw',
             qos_profile=sensor_qos)
         self.rs_wrist_sub = Subscriber(
-            self, CompressedImage, '/rs_wrist/rs_wrist/color/image_raw/compressed',
+            self, Image, '/rs_wrist/rs_wrist/color/image_raw',
             qos_profile=sensor_qos)
         self.rs_head_sub = Subscriber(
-            self, CompressedImage, '/rs_head/rs_head/color/image_raw/compressed',
+            self, Image, '/rs_head/rs_head/color/image_raw',
             qos_profile=sensor_qos)
 
         # Approximate time synchronizer for all streams
@@ -134,9 +138,9 @@ class HDF5DataCollector(Node):
         obs_pose_msg: PoseStamped,
         obs_gripper_msg: Float32,
         hand_pose_msg: PoseStamped,
-        rs_front_msg: CompressedImage,
-        rs_wrist_msg: CompressedImage,
-        rs_head_msg: CompressedImage
+        rs_front_msg: Image,
+        rs_wrist_msg: Image,
+        rs_head_msg: Image
     ):
         """
         Synchronized callback for all data streams.
@@ -176,10 +180,9 @@ class HDF5DataCollector(Node):
         if frame_count % 30 == 0:
             self.get_logger().info(f'Collected {frame_count} frames')
 
-    def parse_color_image(self, msg: CompressedImage) -> np.ndarray:
-        """Convert compressed image to CHW RGB numpy array."""
-        bgr = self._bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    def parse_color_image(self, msg: Image) -> np.ndarray:
+        """Convert raw image to CHW RGB numpy array."""
+        rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
         return rgb.transpose(2, 0, 1)  # (3, H, W)
 
     def start_collection(self):
@@ -273,6 +276,7 @@ class HDF5DataCollector(Node):
             f.attrs['num_frames'] = len(action_pose)
             f.attrs['collection_rate_hz'] = 30
             f.attrs['episode_index'] = self.demo_count
+            f.attrs['latency_offset_sec'] = self._latency_offset
 
         self.get_logger().info(f'Saved episode to {filename}')
 

@@ -14,6 +14,7 @@ This node uses position-only control with fixed orientation.
 
 import time
 import math
+import collections
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -35,6 +36,7 @@ class XArmHandController(Node):
         self.control_rate = self.declare_parameter('control_rate', 30.0).value
         self.p_gain_pos = self.declare_parameter('p_gain_position', 5.0).value
         self.max_linear_vel = self.declare_parameter('max_linear_velocity', 100.0).value  # mm/s
+        self.latency_offset = self.declare_parameter('latency_offset', 0.0).value  # seconds
 
         # Workspace bounds (meters) - safety limits
         self.x_min = self.declare_parameter('workspace_x_min', 0.1).value
@@ -63,6 +65,10 @@ class XArmHandController(Node):
         self.velocity_control_active = False
         self.hand_tracking_active = False
 
+        # Latency delay buffer: stores (timestamp_sec, position, gripper) tuples
+        # Cap at 300 entries (~10s at 30Hz) to prevent unbounded growth
+        self._delay_buffer = collections.deque(maxlen=300)
+
         # Subscribers for hand tracking input
         self.hand_pose_sub = self.create_subscription(
             PoseStamped, 'hand/pose', self.hand_pose_callback, 10)
@@ -90,6 +96,8 @@ class XArmHandController(Node):
         self.get_logger().info('XArm Hand Controller initialized')
         self.get_logger().info(f'Workspace bounds: X[{self.x_min}, {self.x_max}], '
                               f'Y[{self.y_min}, {self.y_max}], Z[{self.z_min}, {self.z_max}]')
+        if self.latency_offset > 0.0:
+            self.get_logger().info(f'Latency delay: {self.latency_offset:.2f}s (buffer max 300 entries)')
 
     def setup_xarm(self):
         """Initialize XArm for control with safety limits."""
@@ -170,8 +178,9 @@ class XArmHandController(Node):
         self.hand_tracking_active = msg.data
 
         if was_active and not self.hand_tracking_active:
-            # Hand tracking lost - stop robot
+            # Hand tracking lost - stop robot and clear delay buffer (safety)
             self.target_position = None
+            self._delay_buffer.clear()
             if self.velocity_control_active:
                 try:
                     self.arm.vc_set_cartesian_velocity([0, 0, 0, 0, 0, 0])
@@ -181,6 +190,7 @@ class XArmHandController(Node):
     def hand_pose_callback(self, msg: PoseStamped):
         """
         Receive hand pose and update target position.
+        When latency_offset > 0, buffers the entry for delayed consumption.
         """
         if self.is_resetting or self.is_paused:
             return
@@ -194,10 +204,16 @@ class XArmHandController(Node):
             ])
 
             # Apply workspace bounds
-            self.target_position = self.clip_to_workspace(position)
+            clipped = self.clip_to_workspace(position)
 
-            # Publish action for data collection
-            self.publish_action_pose(self.target_position, msg.header.stamp)
+            if self.latency_offset > 0.0:
+                # Buffer for delayed consumption
+                now = self.get_clock().now().nanoseconds / 1e9
+                self._delay_buffer.append((now, clipped, None))
+            else:
+                # Zero latency: apply immediately (original path)
+                self.target_position = clipped
+                self.publish_action_pose(self.target_position, msg.header.stamp)
 
             # Ensure we're in velocity mode
             if not self.is_paused and self.hand_tracking_active:
@@ -207,22 +223,29 @@ class XArmHandController(Node):
             self.get_logger().error(f'Error in hand pose callback: {e}')
 
     def gripper_callback(self, msg: Float32):
-        """Receive gripper command from hand tracker."""
+        """Receive gripper command from hand tracker.
+        When latency_offset > 0, buffers the entry for delayed consumption."""
         if self.is_resetting or self.is_paused:
             return
 
         try:
-            self.gripper_cmd = msg.data
+            if self.latency_offset > 0.0:
+                # Buffer for delayed consumption
+                now = self.get_clock().now().nanoseconds / 1e9
+                self._delay_buffer.append((now, None, msg.data))
+            else:
+                # Zero latency: apply immediately (original path)
+                self.gripper_cmd = msg.data
 
-            # Convert normalized [0-1] to XArm gripper [850-0]
-            # 0 = open (850), 1 = closed (0)
-            grasp = 850 - 850 * self.gripper_cmd
-            self.arm.set_gripper_position(int(grasp), wait=False)
+                # Convert normalized [0-1] to XArm gripper [850-0]
+                # 0 = open (850), 1 = closed (0)
+                grasp = 850 - 850 * self.gripper_cmd
+                self.arm.set_gripper_position(int(grasp), wait=False)
 
-            # Publish action for data collection
-            gripper_msg = Float32()
-            gripper_msg.data = self.gripper_cmd
-            self.action_gripper_pub.publish(gripper_msg)
+                # Publish action for data collection
+                gripper_msg = Float32()
+                gripper_msg.data = self.gripper_cmd
+                self.action_gripper_pub.publish(gripper_msg)
 
         except Exception as e:
             self.get_logger().error(f'Error in gripper callback: {e}')
@@ -255,7 +278,32 @@ class XArmHandController(Node):
         """
         Main control loop - computes and sends velocity commands.
         Runs at control_rate Hz.
+
+        When latency_offset > 0, drains buffered entries whose age >= latency_offset.
         """
+        # Drain delay buffer if latency is active
+        if self.latency_offset > 0.0 and len(self._delay_buffer) > 0:
+            now = self.get_clock().now().nanoseconds / 1e9
+            cutoff = now - self.latency_offset
+
+            while len(self._delay_buffer) > 0 and self._delay_buffer[0][0] <= cutoff:
+                ts, position, gripper = self._delay_buffer.popleft()
+
+                if position is not None:
+                    self.target_position = position
+                    # Publish action pose at consumption time
+                    stamp = self.get_clock().now().to_msg()
+                    self.publish_action_pose(self.target_position, stamp)
+
+                if gripper is not None:
+                    self.gripper_cmd = gripper
+                    grasp = 850 - 850 * self.gripper_cmd
+                    self.arm.set_gripper_position(int(grasp), wait=False)
+
+                    gripper_msg = Float32()
+                    gripper_msg.data = self.gripper_cmd
+                    self.action_gripper_pub.publish(gripper_msg)
+
         if (self.is_paused or self.is_resetting or
             self.target_position is None or not self.velocity_control_active):
             return

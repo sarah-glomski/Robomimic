@@ -23,7 +23,7 @@ def generate_launch_description():
 
     hand_tracker = os.path.join(script_dir, 'mediapipe_hand_tracker.py')
     frame_visualizer = os.path.join(script_dir, 'viser_frame_visualizer.py')
-
+    camera_viewer = os.path.join(script_dir, 'ros_camera_viewer.py')
     return LaunchDescription([
         # MediaPipe Hand Tracker
         ExecuteProcess(
@@ -39,6 +39,13 @@ def generate_launch_description():
             output='screen'
         ),
 
+        # Camera Feed Viewer (OpenCV windows from ROS topics)
+        ExecuteProcess(
+            cmd=['python3', camera_viewer],
+            name='ros_camera_viewer',
+            output='screen'
+        ),
+
         # RealSense Camera 1: Front view
         Node(
             package='realsense2_camera',
@@ -47,7 +54,7 @@ def generate_launch_description():
             namespace='rs_front',
             output='screen',
             parameters=[{
-                'serial_no': '317222072257',
+                'serial_no': '244222071219',
                 'camera_name': 'rs_front',
                 'enable_color': True,
                 'enable_depth': False,
@@ -70,7 +77,10 @@ def generate_launch_description():
                 'serial_no': '845112071112',
                 'camera_name': 'rs_head',
                 'enable_color': True,
-                'enable_depth': False,
+                'enable_depth': True,
+                'enable_sync': True,
+                'align_depth.enable': True,
+                'depth_module.depth_profile': '640x360x30',
                 'enable_infra1': False,
                 'enable_infra2': False,
                 'enable_gyro': False,

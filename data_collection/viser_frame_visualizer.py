@@ -14,6 +14,7 @@ Displays:
 Access visualization at: http://localhost:8080
 """
 
+import collections
 import threading
 import numpy as np
 import viser
@@ -67,8 +68,10 @@ class ViserFrameVisualizer(Node):
         self.declare_parameter('workspace_y_max', 0.3)
         self.declare_parameter('workspace_z_min', 0.05)
         self.declare_parameter('workspace_z_max', 0.4)
+        self.declare_parameter('latency_offset', 0.0)  # For sim mode internal delay
 
         viser_port = self.get_parameter('viser_port').value
+        self._latency_offset = self.get_parameter('latency_offset').value
         self.workspace_bounds = {
             'x_min': self.get_parameter('workspace_x_min').value,
             'x_max': self.get_parameter('workspace_x_max').value,
@@ -102,9 +105,20 @@ class ViserFrameVisualizer(Node):
         self.tracking_sub = self.create_subscription(
             Bool, 'hand/tracking_active', self.tracking_callback, 10)
 
+        # Subscribe to robot_action/pose (published by controller with latency applied)
+        self.action_pose_sub = self.create_subscription(
+            PoseStamped, 'robot_action/pose', self.action_pose_callback, sensor_qos)
+
         # State
         self._hand_tracking_active = False
         self._landmarks = None
+
+        # Internal delay buffer for sim mode (when no controller is running)
+        self._delay_buffer = collections.deque(maxlen=300)
+        self._has_action_pose = False  # True once we receive robot_action/pose
+        if self._latency_offset > 0.0:
+            self._delay_timer = self.create_timer(1.0 / 30.0, self._drain_delay_buffer)
+            self.get_logger().info(f'Sim mode delay: {self._latency_offset:.2f}s')
 
         self.get_logger().info(f'Viser Frame Visualizer initialized')
         self.get_logger().info(f'Open browser to: http://localhost:{viser_port}')
@@ -138,6 +152,17 @@ class ViserFrameVisualizer(Node):
             axes_length=0.05,
             axes_radius=0.003,
             origin_color=(50, 100, 255),
+            visible=False,
+        )
+
+        # Delayed target frame (orange) - shows where robot is commanded to go
+        self.delayed_target_frame = self.server.scene.add_frame(
+            "/delayed_target",
+            wxyz=(1.0, 0.0, 0.0, 0.0),
+            position=(0.3, 0.0, 0.2),
+            axes_length=0.06,
+            axes_radius=0.004,
+            origin_color=(255, 165, 0),
             visible=False,
         )
 
@@ -259,6 +284,35 @@ class ViserFrameVisualizer(Node):
         self.hand_palm_frame.position = (pos.x, pos.y, pos.z)
         self.hand_palm_frame.wxyz = (ori.w, ori.x, ori.y, ori.z)
 
+        # In sim mode with latency, buffer hand pose for delayed target display
+        if self._latency_offset > 0.0 and not self._has_action_pose:
+            now = self.get_clock().now().nanoseconds / 1e9
+            self._delay_buffer.append((now, (pos.x, pos.y, pos.z)))
+
+    def action_pose_callback(self, msg: PoseStamped):
+        """Update delayed target frame from controller's robot_action/pose."""
+        self._has_action_pose = True
+        pos = msg.pose.position
+        self.delayed_target_frame.position = (pos.x, pos.y, pos.z)
+        self.delayed_target_frame.visible = self._hand_tracking_active
+
+    def _drain_delay_buffer(self):
+        """Drain sim-mode internal delay buffer for delayed target visualization."""
+        if self._has_action_pose or len(self._delay_buffer) == 0:
+            return
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        cutoff = now - self._latency_offset
+
+        last_position = None
+        while len(self._delay_buffer) > 0 and self._delay_buffer[0][0] <= cutoff:
+            _, position = self._delay_buffer.popleft()
+            last_position = position
+
+        if last_position is not None:
+            self.delayed_target_frame.position = last_position
+            self.delayed_target_frame.visible = self._hand_tracking_active
+
     def tracking_callback(self, msg: Bool):
         """Update hand tracking status."""
         self._hand_tracking_active = msg.data
@@ -270,6 +324,9 @@ class ViserFrameVisualizer(Node):
                 self._hand_points_handle.visible = False
             if self._hand_skeleton_handle is not None:
                 self._hand_skeleton_handle.visible = False
+            # Hide delayed target and clear buffer
+            self.delayed_target_frame.visible = False
+            self._delay_buffer.clear()
 
     def landmarks_callback(self, msg: Float32MultiArray):
         """Update hand landmarks visualization."""
