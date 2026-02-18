@@ -50,12 +50,12 @@ def generate_launch_description():
             output='screen'
         ),
 
-        # # XArm Hand Controller
-        # ExecuteProcess(
-        #     cmd=['python3', hand_controller],
-        #     name='xarm_hand_controller',
-        #     output='screen'
-        # ),
+        # XArm Hand Controller
+        ExecuteProcess(
+            cmd=['python3', hand_controller],
+            name='xarm_hand_controller',
+            output='screen'
+        ),
 
         # HDF5 Data Collector (runs pygame in main thread)
         ExecuteProcess(

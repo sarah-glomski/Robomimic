@@ -9,7 +9,7 @@ Subscribes to hand tracking data and controls the xArm robot:
 - Publishes robot_action/pose and robot_action/gripper for data collection
 - Handles reset and pause commands
 
-This node uses position-only control with fixed orientation.
+This node uses mode 7 (Cartesian online trajectory planning) for smooth motion.
 """
 
 import time
@@ -34,8 +34,7 @@ class XArmHandController(Node):
         # Declare parameters
         self.ip = self.declare_parameter('xarm_ip', '192.168.1.219').value
         self.control_rate = self.declare_parameter('control_rate', 30.0).value
-        self.p_gain_pos = self.declare_parameter('p_gain_position', 5.0).value
-        self.max_linear_vel = self.declare_parameter('max_linear_velocity', 100.0).value  # mm/s
+        self.max_tcp_speed = self.declare_parameter('max_tcp_speed', 100.0).value  # mm/s
         self.latency_offset = self.declare_parameter('latency_offset', 0.0).value  # seconds
 
         # Workspace bounds (meters) - safety limits
@@ -67,7 +66,7 @@ class XArmHandController(Node):
         self.gripper_cmd = 0.0  # 0 = open, 1 = closed
         self.is_paused = False
         self.is_resetting = False
-        self.velocity_control_active = False
+        self.servo_active = False  # True when in mode 7
         self.hand_tracking_active = False
 
         # Latency delay buffer: stores (timestamp_sec, position, gripper, yaw) tuples
@@ -140,25 +139,22 @@ class XArmHandController(Node):
         self.arm.clean_gripper_error()
         self.get_logger().info('Gripper initialized')
 
-    def switch_to_velocity_mode(self):
-        """Switch XArm to velocity control mode."""
-        if not self.velocity_control_active:
-            self.arm.set_mode(5)  # Cartesian velocity control
+    def switch_to_online_trajectory_mode(self):
+        """Switch XArm to mode 7 (Cartesian online trajectory planning)."""
+        if not self.servo_active:
+            self.arm.set_mode(7)
             self.arm.set_state(0)
             time.sleep(0.1)
-            self.velocity_control_active = True
-            self.get_logger().debug('Switched to velocity control mode')
+            self.servo_active = True
+            self.get_logger().debug('Switched to online trajectory mode (mode 7)')
 
     def switch_to_position_mode(self):
-        """Switch XArm to position control mode."""
-        if self.velocity_control_active:
-            # Stop any ongoing velocity
-            self.arm.vc_set_cartesian_velocity([0, 0, 0, 0, 0, 0])
-            time.sleep(0.1)
+        """Switch XArm to position control mode (mode 0)."""
+        if self.servo_active:
             self.arm.set_mode(0)
             self.arm.set_state(0)
             time.sleep(0.1)
-            self.velocity_control_active = False
+            self.servo_active = False
             self.get_logger().debug('Switched to position control mode')
 
     def clip_to_workspace(self, position: np.ndarray) -> np.ndarray:
@@ -188,11 +184,6 @@ class XArmHandController(Node):
             self.target_position = None
             self.target_yaw = math.radians(self.fixed_yaw)
             self._delay_buffer.clear()
-            if self.velocity_control_active:
-                try:
-                    self.arm.vc_set_cartesian_velocity([0, 0, 0, 0, 0, 0])
-                except:
-                    pass
 
     def hand_pose_callback(self, msg: PoseStamped):
         """
@@ -232,9 +223,9 @@ class XArmHandController(Node):
                 self.target_yaw = yaw
                 self.publish_action_pose(self.target_position, msg.header.stamp)
 
-            # Ensure we're in velocity mode
+            # Ensure we're in online trajectory mode
             if not self.is_paused and self.hand_tracking_active:
-                self.switch_to_velocity_mode()
+                self.switch_to_online_trajectory_mode()
 
         except Exception as e:
             self.get_logger().error(f'Error in hand pose callback: {e}')
@@ -293,7 +284,7 @@ class XArmHandController(Node):
 
     def control_loop(self):
         """
-        Main control loop - computes and sends velocity commands.
+        Main control loop - sends target position to robot via mode 7.
         Runs at control_rate Hz.
 
         When latency_offset > 0, drains buffered entries whose age >= latency_offset.
@@ -326,78 +317,29 @@ class XArmHandController(Node):
                     self.action_gripper_pub.publish(gripper_msg)
 
         if (self.is_paused or self.is_resetting or
-            self.target_position is None or not self.velocity_control_active):
+            self.target_position is None or not self.servo_active):
             return
 
         try:
-            # Get current position
-            code, current_pos = self.arm.get_position(is_radian=True)
-            if code != 0:
-                self.get_logger().warn(f'Failed to get position, code: {code}')
-                return
-
-            # Current position in mm
-            current_x_mm, current_y_mm, current_z_mm = current_pos[0:3]
-            current_roll, current_pitch, current_yaw = current_pos[3:6]
-
             # Target position in mm
             target_x_mm = self.target_position[0] * 1000.0
             target_y_mm = self.target_position[1] * 1000.0
             target_z_mm = self.target_position[2] * 1000.0
 
-            # Target orientation in radians (roll/pitch fixed, yaw tracked)
-            target_roll = math.radians(self.fixed_roll)
-            target_pitch = math.radians(self.fixed_pitch)
-            target_yaw = self.target_yaw
+            # Target orientation in degrees (roll/pitch fixed, yaw tracked)
+            target_roll_deg = self.fixed_roll
+            target_pitch_deg = self.fixed_pitch
+            target_yaw_deg = math.degrees(self.target_yaw)
 
-            # Calculate position errors
-            error_x = target_x_mm - current_x_mm
-            error_y = target_y_mm - current_y_mm
-            error_z = target_z_mm - current_z_mm
-
-            # Calculate orientation errors
-            error_roll = self.angle_diff(target_roll, current_roll)
-            error_pitch = self.angle_diff(target_pitch, current_pitch)
-            error_yaw = self.angle_diff(target_yaw, current_yaw)
-
-            # P-control for velocity
-            vel_x = self.p_gain_pos * error_x
-            vel_y = self.p_gain_pos * error_y
-            vel_z = self.p_gain_pos * error_z
-            vel_roll = 1.0 * error_roll
-            vel_pitch = 1.0 * error_pitch
-            vel_yaw = 1.0 * error_yaw
-
-            # Apply velocity limits
-            vel_linear = np.array([vel_x, vel_y, vel_z])
-            vel_linear_norm = np.linalg.norm(vel_linear)
-            if vel_linear_norm > self.max_linear_vel:
-                vel_linear = vel_linear * (self.max_linear_vel / vel_linear_norm)
-                vel_x, vel_y, vel_z = vel_linear
-
-            # Limit angular velocity
-            max_angular_vel = 1.0
-            vel_angular = np.array([vel_roll, vel_pitch, vel_yaw])
-            vel_angular_norm = np.linalg.norm(vel_angular)
-            if vel_angular_norm > max_angular_vel:
-                vel_angular = vel_angular * (max_angular_vel / vel_angular_norm)
-                vel_roll, vel_pitch, vel_yaw = vel_angular
-
-            # Send velocity command
-            velocities = [vel_x, vel_y, vel_z, vel_roll, vel_pitch, vel_yaw]
-            self.arm.vc_set_cartesian_velocity(velocities)
+            # Send target pose — mode 7 handles trajectory planning
+            self.arm.set_position(
+                x=target_x_mm, y=target_y_mm, z=target_z_mm,
+                roll=target_roll_deg, pitch=target_pitch_deg, yaw=target_yaw_deg,
+                speed=self.max_tcp_speed, is_radian=False, wait=False
+            )
 
         except Exception as e:
             self.get_logger().error(f'Error in control loop: {e}')
-
-    def angle_diff(self, target: float, current: float) -> float:
-        """Calculate shortest angular difference."""
-        diff = target - current
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
-        return diff
 
     def reset_callback(self, msg: Bool):
         """Reset robot to home position."""
@@ -434,23 +376,15 @@ class XArmHandController(Node):
 
         if self.is_paused:
             self.get_logger().info('XArm motion paused')
-            if self.velocity_control_active:
-                try:
-                    self.arm.vc_set_cartesian_velocity([0, 0, 0, 0, 0, 0])
-                except:
-                    pass
         else:
             self.get_logger().info('XArm motion resumed')
             if self.target_position is not None and self.hand_tracking_active:
-                self.switch_to_velocity_mode()
+                self.switch_to_online_trajectory_mode()
 
     def destroy_node(self):
         """Clean shutdown."""
         self.get_logger().info('Disconnecting from XArm...')
         try:
-            if self.velocity_control_active:
-                self.arm.vc_set_cartesian_velocity([0, 0, 0, 0, 0, 0])
-                time.sleep(0.1)
             self.arm.disconnect()
         except:
             pass

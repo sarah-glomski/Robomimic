@@ -48,8 +48,8 @@ class MediaPipeHandTracker(Node):
         self.declare_parameter('position_offset_y', 0.0)
         self.declare_parameter('position_offset_z', 0.2)
         self.declare_parameter('filter_alpha', 0.3)
-        self.declare_parameter('detection_confidence', 0.7)
-        self.declare_parameter('tracking_confidence', 0.5)
+        self.declare_parameter('detection_confidence', 0.2)
+        self.declare_parameter('tracking_confidence', 0.15)
 
         self.declare_parameter('hand_yaw_offset_deg', -90.0)
 
