@@ -15,6 +15,7 @@ Supports two modes:
   heuristic scaling (original behavior).
 """
 
+import math
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -50,10 +51,21 @@ class MediaPipeHandTracker(Node):
         self.declare_parameter('detection_confidence', 0.7)
         self.declare_parameter('tracking_confidence', 0.5)
 
+        self.declare_parameter('hand_yaw_offset_deg', -90.0)
+
         # Depth parameters
         self.declare_parameter('use_depth', True)
         self.declare_parameter('max_valid_depth_m', 1.5)
         self.declare_parameter('min_valid_depth_m', 0.1)
+
+        # Object-relative transform parameters
+        self.declare_parameter('use_object_relative', True)
+        self.declare_parameter('human_object_x', 0.3)
+        self.declare_parameter('human_object_y', -0.35)
+        self.declare_parameter('human_object_z', 0.0)
+        self.declare_parameter('robot_object_x', 0.3)
+        self.declare_parameter('robot_object_y', 0.0)
+        self.declare_parameter('robot_object_z', 0.0)
 
         position_scale = self.get_parameter('position_scale').value
         position_offset = np.array([
@@ -65,9 +77,24 @@ class MediaPipeHandTracker(Node):
         detection_conf = self.get_parameter('detection_confidence').value
         tracking_conf = self.get_parameter('tracking_confidence').value
 
+        self._hand_yaw_offset = math.radians(self.get_parameter('hand_yaw_offset_deg').value)
+
         self._use_depth = self.get_parameter('use_depth').value
         self._max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
         self._min_valid_depth_m = self.get_parameter('min_valid_depth_m').value
+
+        # Object-relative transform
+        self._use_object_relative = self.get_parameter('use_object_relative').value
+        self._human_object_pos = np.array([
+            self.get_parameter('human_object_x').value,
+            self.get_parameter('human_object_y').value,
+            self.get_parameter('human_object_z').value,
+        ])
+        self._robot_object_pos = np.array([
+            self.get_parameter('robot_object_x').value,
+            self.get_parameter('robot_object_y').value,
+            self.get_parameter('robot_object_z').value,
+        ])
 
         # Initialize MediaPipe Hands
         self.mp_hands = mp.solutions.hands
@@ -109,9 +136,10 @@ class MediaPipeHandTracker(Node):
         ], dtype=np.float64)
         self._cam_to_robot_translation = np.array([0.28, 0.0, 1.02], dtype=np.float64)
 
-        # Low-pass filter for depth-based position
+        # Low-pass filters for depth-based position and yaw
         from utils.hand_to_action import LowPassFilter
         self._depth_position_filter = LowPassFilter(alpha=filter_alpha)
+        self._yaw_filter = LowPassFilter(alpha=filter_alpha)
 
         # QoS for camera streams
         sensor_qos = QoSProfile(
@@ -187,6 +215,7 @@ class MediaPipeHandTracker(Node):
 
         # Publishers
         self.hand_pose_pub = self.create_publisher(PoseStamped, 'hand/pose', 10)
+        self.eef_target_pub = self.create_publisher(PoseStamped, 'eef/pose_target', 10)
         self.gripper_cmd_pub = self.create_publisher(Float32, 'hand/gripper_cmd', 10)
         self.tracking_active_pub = self.create_publisher(Bool, 'hand/tracking_active', 10)
         self.landmarks_pub = self.create_publisher(Float32MultiArray, 'hand/landmarks', 10)
@@ -200,6 +229,11 @@ class MediaPipeHandTracker(Node):
 
         self.get_logger().info('MediaPipe Hand Tracker initialized')
         self.get_logger().info(f'Position scale: {position_scale}, offset: {position_offset}')
+        if self._use_object_relative:
+            self.get_logger().info(
+                f'Object-relative transform: human={self._human_object_pos}, '
+                f'robot={self._robot_object_pos}'
+            )
 
     def _diag_color_callback(self, msg):
         """Count color messages for diagnostics."""
@@ -384,6 +418,40 @@ class MediaPipeHandTracker(Node):
 
         return np.mean(valid_robot_points, axis=0)
 
+    def get_hand_yaw_depth(
+        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int
+    ):
+        """
+        Compute hand yaw angle from backprojected wrist and middle_mcp landmarks.
+
+        Returns:
+            Yaw angle in radians, or None if depth invalid for either landmark.
+        """
+        points = []
+        for idx in [0, 9]:  # wrist, middle_mcp
+            lm = landmarks[idx]
+            u = max(0, min(int(lm.x * img_w), img_w - 1))
+            v = max(0, min(int(lm.y * img_h), img_h - 1))
+            depth_m = self._sample_depth_patch(depth_image, u, v)
+            if depth_m <= 0.0:
+                return None
+            point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m)
+            points.append(self._camera_to_robot_frame(point_cam))
+
+        forward = points[1] - points[0]  # wrist → middle_mcp
+        return math.atan2(forward[1], forward[0])
+
+    def get_hand_yaw_pixels(self, landmarks):
+        """
+        Compute hand yaw angle from 2D pixel coordinates (fallback, no depth).
+
+        Camera-to-robot mapping: cam X → robot Y, cam Y → robot X.
+        """
+        dx = landmarks[9].x - landmarks[0].x  # camera X delta
+        dy = landmarks[9].y - landmarks[0].y  # camera Y delta
+        # In robot frame: forward_x ~ dy, forward_y ~ dx
+        return math.atan2(dx, dy)
+
     def publish_landmarks_3d(
         self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int
     ):
@@ -456,6 +524,16 @@ class MediaPipeHandTracker(Node):
             if tracking_active:
                 landmarks = results.multi_hand_landmarks[0].landmark
 
+                # Compute hand yaw from depth
+                raw_yaw = self.get_hand_yaw_depth(
+                    landmarks, depth_image, img_w, img_h
+                )
+                if raw_yaw is not None:
+                    yaw = self._yaw_filter.filter(np.array([raw_yaw]))[0]
+                else:
+                    # Keep last filtered value, or 0 if no previous
+                    yaw = self._yaw_filter.value[0] if self._yaw_filter.value is not None else 0.0
+
                 # Attempt backprojected palm position
                 palm_robot = self.get_backprojected_palm_position(
                     landmarks, depth_image, img_w, img_h
@@ -464,11 +542,11 @@ class MediaPipeHandTracker(Node):
                 if palm_robot is not None:
                     # Apply low-pass filter
                     palm_robot = self._depth_position_filter.filter(palm_robot)
-                    self.publish_hand_pose(palm_robot, color_msg.header.stamp)
+                    self.publish_hand_pose(palm_robot, color_msg.header.stamp, yaw)
                 else:
                     # Fallback to MediaPipe normalized coordinates
                     action = self.transformer.landmarks_to_action(landmarks)
-                    self.publish_hand_pose(action['position'], color_msg.header.stamp)
+                    self.publish_hand_pose(action['position'], color_msg.header.stamp, yaw)
 
                 # Publish gripper from pinch gesture (always uses MediaPipe landmarks)
                 gripper = self.transformer.get_gripper_from_pinch(landmarks)
@@ -487,6 +565,7 @@ class MediaPipeHandTracker(Node):
                     self.get_logger().info('Hand tracking lost')
                     self.transformer.reset()
                     self._depth_position_filter.reset()
+                    self._yaw_filter.reset()
 
             self._last_tracking_active = tracking_active
 
@@ -518,11 +597,15 @@ class MediaPipeHandTracker(Node):
                 # Get first hand landmarks
                 landmarks = results.multi_hand_landmarks[0].landmark
 
+                # Compute hand yaw from pixel coordinates
+                raw_yaw = self.get_hand_yaw_pixels(landmarks)
+                yaw = self._yaw_filter.filter(np.array([raw_yaw]))[0]
+
                 # Transform to robot action
                 action = self.transformer.landmarks_to_action(landmarks)
 
-                # Publish hand pose
-                self.publish_hand_pose(action['position'], msg.header.stamp)
+                # Publish hand pose with yaw
+                self.publish_hand_pose(action['position'], msg.header.stamp, yaw)
 
                 # Publish gripper command
                 gripper_msg = Float32()
@@ -540,19 +623,27 @@ class MediaPipeHandTracker(Node):
                     self.get_logger().info('Hand tracking lost')
                     # Reset filters when tracking is lost
                     self.transformer.reset()
+                    self._yaw_filter.reset()
 
             self._last_tracking_active = tracking_active
 
         except Exception as e:
             self.get_logger().error(f'Error in image callback: {e}')
 
-    def publish_hand_pose(self, position: np.ndarray, stamp):
+    def publish_hand_pose(self, position: np.ndarray, stamp, yaw: float = 0.0):
         """
-        Publish hand pose as PoseStamped.
+        Publish hand pose as PoseStamped (actual hand position in robot frame).
+        Also publishes the EEF target (object-relative transformed position).
 
         Position is in robot frame (meters).
-        Orientation is set to identity (not used for position-only control).
+        Orientation encodes hand yaw as a Z-rotation quaternion.
         """
+        # Apply hand-to-robot yaw offset, then encode as Z-rotation quaternion
+        yaw = yaw - self._hand_yaw_offset
+        qx, qy = 0.0, 0.0
+        qz = math.sin(yaw / 2.0)
+        qw = math.cos(yaw / 2.0)
+
         msg = PoseStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = "base_link"
@@ -561,13 +652,32 @@ class MediaPipeHandTracker(Node):
         msg.pose.position.y = float(position[1])
         msg.pose.position.z = float(position[2])
 
-        # Identity quaternion (orientation not used for position-only control)
-        msg.pose.orientation.x = 0.0
-        msg.pose.orientation.y = 0.0
-        msg.pose.orientation.z = 0.0
-        msg.pose.orientation.w = 1.0
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
 
         self.hand_pose_pub.publish(msg)
+
+        # Compute and publish EEF target (object-relative transform)
+        if self._use_object_relative:
+            delta = position - self._human_object_pos
+            target = self._robot_object_pos + delta
+        else:
+            target = position
+
+        target_msg = PoseStamped()
+        target_msg.header.stamp = stamp
+        target_msg.header.frame_id = "base_link"
+        target_msg.pose.position.x = float(target[0])
+        target_msg.pose.position.y = float(target[1])
+        target_msg.pose.position.z = float(target[2])
+        target_msg.pose.orientation.x = qx
+        target_msg.pose.orientation.y = qy
+        target_msg.pose.orientation.z = qz
+        target_msg.pose.orientation.w = qw
+
+        self.eef_target_pub.publish(target_msg)
 
     def publish_landmarks(self, landmarks):
         """

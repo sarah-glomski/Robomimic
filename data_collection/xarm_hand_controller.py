@@ -51,6 +51,10 @@ class XArmHandController(Node):
         self.fixed_pitch = self.declare_parameter('fixed_pitch_deg', 0.0).value
         self.fixed_yaw = self.declare_parameter('fixed_yaw_deg', 0.0).value
 
+        # Yaw limits (applied to hand-tracked yaw + fixed_yaw offset)
+        self.yaw_min_deg = self.declare_parameter('yaw_min_deg', -120.0).value
+        self.yaw_max_deg = self.declare_parameter('yaw_max_deg', 120.0).value
+
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 
         # Initialize XArm
@@ -59,19 +63,21 @@ class XArmHandController(Node):
 
         # Control state
         self.target_position = None  # Target XYZ in meters
+        self.target_yaw = math.radians(self.fixed_yaw)  # Target yaw in radians
         self.gripper_cmd = 0.0  # 0 = open, 1 = closed
         self.is_paused = False
         self.is_resetting = False
         self.velocity_control_active = False
         self.hand_tracking_active = False
 
-        # Latency delay buffer: stores (timestamp_sec, position, gripper) tuples
+        # Latency delay buffer: stores (timestamp_sec, position, gripper, yaw) tuples
         # Cap at 300 entries (~10s at 30Hz) to prevent unbounded growth
         self._delay_buffer = collections.deque(maxlen=300)
 
         # Subscribers for hand tracking input
+        # Subscribe to eef/pose_target (object-relative transformed position)
         self.hand_pose_sub = self.create_subscription(
-            PoseStamped, 'hand/pose', self.hand_pose_callback, 10)
+            PoseStamped, 'eef/pose_target', self.hand_pose_callback, 10)
         self.hand_gripper_sub = self.create_subscription(
             Float32, 'hand/gripper_cmd', self.gripper_callback, 10)
         self.tracking_status_sub = self.create_subscription(
@@ -180,6 +186,7 @@ class XArmHandController(Node):
         if was_active and not self.hand_tracking_active:
             # Hand tracking lost - stop robot and clear delay buffer (safety)
             self.target_position = None
+            self.target_yaw = math.radians(self.fixed_yaw)
             self._delay_buffer.clear()
             if self.velocity_control_active:
                 try:
@@ -189,7 +196,7 @@ class XArmHandController(Node):
 
     def hand_pose_callback(self, msg: PoseStamped):
         """
-        Receive hand pose and update target position.
+        Receive hand pose and update target position and yaw.
         When latency_offset > 0, buffers the entry for delayed consumption.
         """
         if self.is_resetting or self.is_paused:
@@ -203,16 +210,26 @@ class XArmHandController(Node):
                 msg.pose.position.z
             ])
 
+            # Extract hand yaw from Z-rotation quaternion
+            o = msg.pose.orientation
+            hand_yaw = math.atan2(2.0 * (o.w * o.z + o.x * o.y),
+                                  1.0 - 2.0 * (o.y * o.y + o.z * o.z))
+            # Add fixed_yaw offset and clamp to limits
+            yaw = math.radians(self.fixed_yaw) + hand_yaw
+            yaw = max(math.radians(self.yaw_min_deg),
+                      min(math.radians(self.yaw_max_deg), yaw))
+
             # Apply workspace bounds
             clipped = self.clip_to_workspace(position)
 
             if self.latency_offset > 0.0:
                 # Buffer for delayed consumption
                 now = self.get_clock().now().nanoseconds / 1e9
-                self._delay_buffer.append((now, clipped, None))
+                self._delay_buffer.append((now, clipped, None, yaw))
             else:
                 # Zero latency: apply immediately (original path)
                 self.target_position = clipped
+                self.target_yaw = yaw
                 self.publish_action_pose(self.target_position, msg.header.stamp)
 
             # Ensure we're in velocity mode
@@ -232,7 +249,7 @@ class XArmHandController(Node):
             if self.latency_offset > 0.0:
                 # Buffer for delayed consumption
                 now = self.get_clock().now().nanoseconds / 1e9
-                self._delay_buffer.append((now, None, msg.data))
+                self._delay_buffer.append((now, None, msg.data, None))
             else:
                 # Zero latency: apply immediately (original path)
                 self.gripper_cmd = msg.data
@@ -260,11 +277,11 @@ class XArmHandController(Node):
         msg.pose.position.y = float(position[1])
         msg.pose.position.z = float(position[2])
 
-        # Fixed orientation quaternion
+        # Orientation quaternion (fixed roll/pitch, tracked yaw)
         quat = R.from_euler('xyz', [
             math.radians(self.fixed_roll),
             math.radians(self.fixed_pitch),
-            math.radians(self.fixed_yaw)
+            self.target_yaw
         ]).as_quat()
 
         msg.pose.orientation.x = float(quat[0])
@@ -287,10 +304,14 @@ class XArmHandController(Node):
             cutoff = now - self.latency_offset
 
             while len(self._delay_buffer) > 0 and self._delay_buffer[0][0] <= cutoff:
-                ts, position, gripper = self._delay_buffer.popleft()
+                ts, position, gripper, yaw = self._delay_buffer.popleft()
 
                 if position is not None:
                     self.target_position = position
+                if yaw is not None:
+                    self.target_yaw = yaw
+
+                if position is not None or yaw is not None:
                     # Publish action pose at consumption time
                     stamp = self.get_clock().now().to_msg()
                     self.publish_action_pose(self.target_position, stamp)
@@ -324,10 +345,10 @@ class XArmHandController(Node):
             target_y_mm = self.target_position[1] * 1000.0
             target_z_mm = self.target_position[2] * 1000.0
 
-            # Target orientation in radians
+            # Target orientation in radians (roll/pitch fixed, yaw tracked)
             target_roll = math.radians(self.fixed_roll)
             target_pitch = math.radians(self.fixed_pitch)
-            target_yaw = math.radians(self.fixed_yaw)
+            target_yaw = self.target_yaw
 
             # Calculate position errors
             error_x = target_x_mm - current_x_mm

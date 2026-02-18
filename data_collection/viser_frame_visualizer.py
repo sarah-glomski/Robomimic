@@ -69,9 +69,25 @@ class ViserFrameVisualizer(Node):
         self.declare_parameter('workspace_z_min', 0.05)
         self.declare_parameter('workspace_z_max', 0.4)
         self.declare_parameter('latency_offset', 0.0)  # For sim mode internal delay
+        self.declare_parameter('human_object_x', 0.3)
+        self.declare_parameter('human_object_y', -0.35)
+        self.declare_parameter('human_object_z', 0.0)
+        self.declare_parameter('robot_object_x', 0.3)
+        self.declare_parameter('robot_object_y', 0.0)
+        self.declare_parameter('robot_object_z', 0.0)
 
         viser_port = self.get_parameter('viser_port').value
         self._latency_offset = self.get_parameter('latency_offset').value
+        self._human_object_pos = (
+            self.get_parameter('human_object_x').value,
+            self.get_parameter('human_object_y').value,
+            self.get_parameter('human_object_z').value,
+        )
+        self._robot_object_pos = (
+            self.get_parameter('robot_object_x').value,
+            self.get_parameter('robot_object_y').value,
+            self.get_parameter('robot_object_z').value,
+        )
         self.workspace_bounds = {
             'x_min': self.get_parameter('workspace_x_min').value,
             'x_max': self.get_parameter('workspace_x_max').value,
@@ -104,6 +120,10 @@ class ViserFrameVisualizer(Node):
             Float32MultiArray, 'hand/landmarks', self.landmarks_callback, sensor_qos)
         self.tracking_sub = self.create_subscription(
             Bool, 'hand/tracking_active', self.tracking_callback, 10)
+
+        # Subscribe to eef/pose_target for delayed target in sim mode
+        self.eef_target_sub = self.create_subscription(
+            PoseStamped, 'eef/pose_target', self.eef_target_callback, sensor_qos)
 
         # Subscribe to robot_action/pose (published by controller with latency applied)
         self.action_pose_sub = self.create_subscription(
@@ -182,6 +202,9 @@ class ViserFrameVisualizer(Node):
 
         # Camera frustums
         self.add_camera_frustums()
+
+        # Object markers (coffee mugs)
+        self.add_object_markers()
 
         # Initialize hand landmarks point cloud (will be updated)
         self._hand_points_handle = None
@@ -268,6 +291,61 @@ class ViserFrameVisualizer(Node):
             text="Front Cam",
         )
 
+    def add_object_markers(self):
+        """Add cylinder markers for human and robot objects (coffee mugs)."""
+        mug_radius = 0.03
+        mug_height = 0.08
+
+        # Human object (purple cylinder)
+        # Cylinder is centered at origin; offset position by half height so bottom sits on table
+        self.server.scene.add_mesh_trimesh(
+            "/objects/human_mug",
+            mesh=self._make_cylinder_mesh(mug_radius, mug_height, color=(160, 80, 200)),
+            position=(
+                self._human_object_pos[0],
+                self._human_object_pos[1],
+                self._human_object_pos[2] + mug_height / 2.0,
+            ),
+        )
+        self.server.scene.add_label(
+            "/objects/human_mug/label",
+            text="Human Mug",
+        )
+
+        # Robot object (cyan cylinder)
+        self.server.scene.add_mesh_trimesh(
+            "/objects/robot_mug",
+            mesh=self._make_cylinder_mesh(mug_radius, mug_height, color=(80, 200, 200)),
+            position=(
+                self._robot_object_pos[0],
+                self._robot_object_pos[1],
+                self._robot_object_pos[2] + mug_height / 2.0,
+            ),
+        )
+        self.server.scene.add_label(
+            "/objects/robot_mug/label",
+            text="Robot Mug",
+        )
+
+    @staticmethod
+    def _make_cylinder_mesh(radius: float, height: float, color: tuple):
+        """Create a trimesh cylinder with the given dimensions and color."""
+        import trimesh
+        mesh = trimesh.creation.cylinder(radius=radius, height=height, sections=16)
+        mesh.visual.face_colors = [color[0], color[1], color[2], 255]
+        return mesh
+
+    @staticmethod
+    def _yaw_to_eef_wxyz(ori):
+        """Compose yaw-only quaternion with roll=180° for EEF display (Z pointing down).
+
+        The hand tracker publishes a pure Z-rotation quaternion (yaw only).
+        This composes it with a 180° X-rotation so frames display with Z down.
+        Quaternion multiply: q_display = q_yaw * q_roll180
+        where q_roll180 wxyz = (0, 1, 0, 0).
+        """
+        return (-ori.x, ori.w, ori.z, -ori.y)
+
     def robot_pose_callback(self, msg: PoseStamped):
         """Update robot EEF frame position."""
         pos = msg.pose.position
@@ -277,23 +355,45 @@ class ViserFrameVisualizer(Node):
         self.robot_eef_frame.wxyz = (ori.w, ori.x, ori.y, ori.z)
 
     def hand_pose_callback(self, msg: PoseStamped):
-        """Update hand palm frame position."""
+        """Update hand palm frame position (actual hand, blue frame)."""
         pos = msg.pose.position
         ori = msg.pose.orientation
 
         self.hand_palm_frame.position = (pos.x, pos.y, pos.z)
-        self.hand_palm_frame.wxyz = (ori.w, ori.x, ori.y, ori.z)
+        self.hand_palm_frame.wxyz = self._yaw_to_eef_wxyz(ori)
 
-        # In sim mode with latency, buffer hand pose for delayed target display
-        if self._latency_offset > 0.0 and not self._has_action_pose:
+    def eef_target_callback(self, msg: PoseStamped):
+        """Update delayed target frame from eef/pose_target (sim mode, orange frame).
+
+        Only used when no controller is running (no robot_action/pose received).
+        The latency delay buffer is applied here independently of the
+        object-relative transform (which was already applied upstream).
+        """
+        if self._has_action_pose:
+            return
+
+        pos = msg.pose.position
+        ori = msg.pose.orientation
+        wxyz = self._yaw_to_eef_wxyz(ori)
+
+        if self._latency_offset > 0.0:
+            # Buffer for delayed display
             now = self.get_clock().now().nanoseconds / 1e9
-            self._delay_buffer.append((now, (pos.x, pos.y, pos.z)))
+            self._delay_buffer.append((now, (pos.x, pos.y, pos.z), wxyz))
+        else:
+            # Zero latency: target follows eef target directly
+            self.delayed_target_frame.position = (pos.x, pos.y, pos.z)
+            self.delayed_target_frame.wxyz = wxyz
+            self.delayed_target_frame.visible = self._hand_tracking_active
 
     def action_pose_callback(self, msg: PoseStamped):
         """Update delayed target frame from controller's robot_action/pose."""
         self._has_action_pose = True
         pos = msg.pose.position
+        ori = msg.pose.orientation
         self.delayed_target_frame.position = (pos.x, pos.y, pos.z)
+        # Controller quaternion already has full orientation (roll=180° + yaw)
+        self.delayed_target_frame.wxyz = (ori.w, ori.x, ori.y, ori.z)
         self.delayed_target_frame.visible = self._hand_tracking_active
 
     def _drain_delay_buffer(self):
@@ -304,13 +404,14 @@ class ViserFrameVisualizer(Node):
         now = self.get_clock().now().nanoseconds / 1e9
         cutoff = now - self._latency_offset
 
-        last_position = None
+        last_entry = None
         while len(self._delay_buffer) > 0 and self._delay_buffer[0][0] <= cutoff:
-            _, position = self._delay_buffer.popleft()
-            last_position = position
+            _, position, wxyz = self._delay_buffer.popleft()
+            last_entry = (position, wxyz)
 
-        if last_position is not None:
-            self.delayed_target_frame.position = last_position
+        if last_entry is not None:
+            self.delayed_target_frame.position = last_entry[0]
+            self.delayed_target_frame.wxyz = last_entry[1]
             self.delayed_target_frame.visible = self._hand_tracking_active
 
     def tracking_callback(self, msg: Bool):
