@@ -28,7 +28,7 @@ class XArmStatePublisher(Node):
         super().__init__('xarm_state_publisher')
 
         # Declare parameter for xarm IP address
-        self.ip = self.declare_parameter('xarm_ip', '192.168.1.153').value  # Changed from .203
+        self.ip = self.declare_parameter('xarm_ip', '192.168.1.219').value
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 
         # Initialize XArm for state reading only
@@ -49,6 +49,8 @@ class XArmStatePublisher(Node):
         """
         Initialize the XArm connection for state reading.
         """
+        self.arm.clean_error()
+        self.arm.clean_warn()
         self.arm.motion_enable(enable=True)
         time.sleep(1)
         self.get_logger().info('XArm connection established for state publishing')
