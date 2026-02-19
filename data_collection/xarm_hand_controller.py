@@ -59,7 +59,7 @@ class XArmHandController(Node):
         self.yaw_max_deg = self.declare_parameter('yaw_max_deg', 120.0).value
 
         # TCP offset: vertical offset from flange to gripper contact point (mm)
-        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 100.0).value
+        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 0.0).value
 
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 

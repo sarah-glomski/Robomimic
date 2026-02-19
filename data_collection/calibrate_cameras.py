@@ -424,6 +424,18 @@ def main():
     )
     print(f"\nComputed {len(corners_3d)} corner positions in robot frame.")
 
+    # Build all 4 possible corner orderings to resolve solvePnP planar ambiguity.
+    # cross(z_up, row_dir) picks one column direction but the actual OpenCV corner
+    # ordering depends on image orientation, so we must try row/col flips too.
+    grid = corners_3d.reshape(args.rows, args.cols, 3)
+    corners_3d_variants = [
+        # ("original",  corners_3d),
+        ("col_flip",  grid[:, ::-1, :].reshape(-1, 3).copy()),
+        # ("row_flip",  grid[::-1, :, :].reshape(-1, 3).copy()),
+        # ("both_flip", corners_3d[::-1].copy()),
+    ]
+    board_z = np.mean(corners_3d[:, 2])
+
     # --- Detect checkerboard and solve for each camera ---
     cam_results = {}
     while True:
@@ -462,34 +474,37 @@ def main():
                 [0, 0, 1],
             ], dtype=np.float64)
 
-            # Try both corner orderings, pick lower reprojection error
-            result_fwd = result_rev = None
-            try:
-                result_fwd = solve_camera_extrinsics(
-                    corners_3d, corners_2d, camera_matrix, intr["dist_coeffs"])
-            except RuntimeError:
-                pass
+            # Try all 4 corner orderings to resolve planar ambiguity.
+            # For a flat checkerboard, solvePnP can place the camera on the
+            # wrong side of the board if the 3D-2D ordering doesn't match.
+            # We pick the solution where the camera is above the board (z > board_z).
+            candidates = []
+            for label, pts_3d in corners_3d_variants:
+                try:
+                    r = solve_camera_extrinsics(
+                        pts_3d, corners_2d, camera_matrix, intr["dist_coeffs"])
+                    r["_label"] = label
+                    candidates.append(r)
+                except RuntimeError:
+                    pass
 
-            corners_2d_rev = corners_2d[::-1].copy()
-            try:
-                result_rev = solve_camera_extrinsics(
-                    corners_3d, corners_2d_rev, camera_matrix, intr["dist_coeffs"])
-            except RuntimeError:
-                pass
-
-            if result_fwd is not None and result_rev is not None:
-                if result_fwd["reprojection_error_px"] <= result_rev["reprojection_error_px"]:
-                    result = result_fwd
-                else:
-                    result = result_rev
-                    print(f"    (Used reversed corner ordering)")
-            elif result_fwd is not None:
-                result = result_fwd
-            elif result_rev is not None:
-                result = result_rev
-            else:
-                print(f"    solvePnP failed for both orderings — skipping.")
+            if not candidates:
+                print(f"    solvePnP failed for all orderings — skipping.")
                 continue
+
+            # Prefer solutions where camera is above the board
+            valid = [c for c in candidates
+                     if c["camera_position_robot_frame"][2] > board_z]
+            if valid:
+                result = min(valid, key=lambda c: c["reprojection_error_px"])
+            else:
+                result = min(candidates, key=lambda c: c["reprojection_error_px"])
+                print(f"    WARNING: No solution has camera above board "
+                      f"(best z={result['camera_position_robot_frame'][2]:.3f})")
+
+            if result["_label"] != "original":
+                print(f"    (Used {result['_label']} corner ordering)")
+            del result["_label"]
 
             cam_results[cam_name] = result
             pos = result["camera_position_robot_frame"]
