@@ -72,7 +72,7 @@ class MediaPipeHandTracker(Node):
         # Final position offset for fine-tuning hand-to-gripper alignment (meters)
         self.declare_parameter('fine_offset_x', 0.0)
         self.declare_parameter('fine_offset_y', 0.02)
-        self.declare_parameter('fine_offset_z', 0.1)
+        self.declare_parameter('fine_offset_z', 0.08)
 
         position_scale = self.get_parameter('position_scale').value
         position_offset = np.array([
