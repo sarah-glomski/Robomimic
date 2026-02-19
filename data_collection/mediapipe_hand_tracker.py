@@ -136,7 +136,7 @@ class MediaPipeHandTracker(Node):
 
         # QoS for camera streams
         sensor_qos = QoSProfile(
-            depth=1,
+            depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST
         )
@@ -170,7 +170,7 @@ class MediaPipeHandTracker(Node):
             )
             self.time_sync = message_filters.ApproximateTimeSynchronizer(
                 [self.color_sub, self.depth_sub],
-                queue_size=5,
+                queue_size=30,
                 slop=0.1,
             )
             self.time_sync.registerCallback(self.synced_image_callback)
@@ -271,7 +271,7 @@ class MediaPipeHandTracker(Node):
 
         # Subscribe to color-only for the original image_callback
         sensor_qos = QoSProfile(
-            depth=1,
+            depth=10,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST
         )
