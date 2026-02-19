@@ -429,10 +429,10 @@ def main():
     # ordering depends on image orientation, so we must try row/col flips too.
     grid = corners_3d.reshape(args.rows, args.cols, 3)
     corners_3d_variants = [
-        ("original",  corners_3d),
+        # ("original",  corners_3d),
         ("col_flip",  grid[:, ::-1, :].reshape(-1, 3).copy()),
-        ("row_flip",  grid[::-1, :, :].reshape(-1, 3).copy()),
-        ("both_flip", corners_3d[::-1].copy()),
+        # ("row_flip",  grid[::-1, :, :].reshape(-1, 3).copy()),
+        # ("both_flip", corners_3d[::-1].copy()),
     ]
     board_z = np.mean(corners_3d[:, 2])
 
