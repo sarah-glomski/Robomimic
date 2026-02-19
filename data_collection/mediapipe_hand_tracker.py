@@ -15,6 +15,8 @@ Supports two modes:
   heuristic scaling (original behavior).
 """
 
+import os
+import json
 import math
 import numpy as np
 import cv2
@@ -123,18 +125,9 @@ class MediaPipeHandTracker(Node):
         self._cy = None
         self._intrinsics_received = False
 
-        # Camera-to-robot extrinsics (derived from head camera pose in visualizer)
-        # Head camera: position=(0.28, 0.0, 1.02), quaternion wxyz=(0.0, 0.7071, 0.7071, 0.0)
-        # This quaternion represents a rotation that maps camera frame to robot frame:
-        #   camera X -> robot Y
-        #   camera Y -> robot X
-        #   camera Z -> robot -Z
-        self._cam_to_robot_rotation = np.array([
-            [0.0, 1.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, -1.0],
-        ], dtype=np.float64)
-        self._cam_to_robot_translation = np.array([0.28, 0.0, 1.02], dtype=np.float64)
+        # Camera-to-robot extrinsics (loaded from calibration file or hardcoded fallback)
+        self._cam_to_robot_rotation, self._cam_to_robot_translation = \
+            self._load_head_camera_extrinsics()
 
         # Low-pass filters for depth-based position and yaw
         from utils.hand_to_action import LowPassFilter
@@ -234,6 +227,49 @@ class MediaPipeHandTracker(Node):
                 f'Object-relative transform: human={self._human_object_pos}, '
                 f'robot={self._robot_object_pos}'
             )
+
+    def _load_head_camera_extrinsics(self):
+        """
+        Load head camera extrinsics from camera_calibration.json if it exists.
+        Falls back to hardcoded defaults if file not found.
+        """
+        default_rotation = np.array([
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ], dtype=np.float64)
+        default_translation = np.array([0.37, 0.0, 1.02], dtype=np.float64)
+
+        calib_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'camera_calibration.json'
+        )
+
+        if not os.path.exists(calib_path):
+            self.get_logger().info('No camera_calibration.json — using hardcoded extrinsics')
+            return default_rotation, default_translation
+
+        try:
+            with open(calib_path, 'r') as f:
+                calib = json.load(f)
+
+            head = calib.get('head_camera')
+            if head is None:
+                self.get_logger().warn('camera_calibration.json missing head_camera — using hardcoded')
+                return default_rotation, default_translation
+
+            rotation = np.array(head['rotation_cam_to_robot'], dtype=np.float64)
+            translation = np.array(head['translation_cam_to_robot'], dtype=np.float64)
+
+            self.get_logger().info(f'Loaded head camera extrinsics from {calib_path}')
+            self.get_logger().info(
+                f'  Translation: [{translation[0]:.4f}, {translation[1]:.4f}, {translation[2]:.4f}]'
+            )
+            return rotation, translation
+
+        except Exception as e:
+            self.get_logger().warn(f'Failed to load calibration: {e} — using hardcoded')
+            return default_rotation, default_translation
 
     def _diag_color_callback(self, msg):
         """Count color messages for diagnostics."""

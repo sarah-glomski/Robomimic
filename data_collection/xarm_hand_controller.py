@@ -28,6 +28,10 @@ class XArmHandController(Node):
     """
     ROS2 node that controls XArm based on hand tracking input.
     """
+    # Software clip margin inside the hardware fence (meters)
+    # Keeps targets 10mm away from the fence to avoid triggering error 35
+    BOUNDARY_MARGIN = 0.01
+
     def __init__(self):
         super().__init__('xarm_hand_controller')
 
@@ -39,7 +43,7 @@ class XArmHandController(Node):
 
         # Workspace bounds (meters) - safety limits
         self.x_min = self.declare_parameter('workspace_x_min', 0.1).value
-        self.x_max = self.declare_parameter('workspace_x_max', 0.5).value
+        self.x_max = self.declare_parameter('workspace_x_max', 0.7).value
         self.y_min = self.declare_parameter('workspace_y_min', -0.3).value
         self.y_max = self.declare_parameter('workspace_y_max', 0.3).value
         self.z_min = self.declare_parameter('workspace_z_min', 0.05).value
@@ -53,6 +57,9 @@ class XArmHandController(Node):
         # Yaw limits (applied to hand-tracked yaw + fixed_yaw offset)
         self.yaw_min_deg = self.declare_parameter('yaw_min_deg', -120.0).value
         self.yaw_max_deg = self.declare_parameter('yaw_max_deg', 120.0).value
+
+        # TCP offset: vertical offset from flange to gripper contact point (mm)
+        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 100.0).value
 
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 
@@ -113,6 +120,10 @@ class XArmHandController(Node):
         self.arm.set_state(state=0)
         time.sleep(1)
 
+        # Set TCP offset so positions reference the gripper tip, not the flange
+        self.arm.set_tcp_offset([0, 0, self.tcp_offset_z, 0, 0, 0])
+        time.sleep(0.1)
+
         # Hardware-level safety boundaries (mm)
         # Format: [x_max, x_min, y_max, y_min, z_max, z_min]
         self.arm.set_reduced_tcp_boundary([
@@ -157,6 +168,26 @@ class XArmHandController(Node):
             self.servo_active = False
             self.get_logger().debug('Switched to position control mode')
 
+    def recover_from_error(self):
+        """Attempt to recover from xArm error state. Returns True if recovery was needed."""
+        error_code = self.arm.error_code
+        if error_code == 0:
+            return False
+
+        self.get_logger().warn(f'xArm error {error_code}, recovering...')
+        self.arm.clean_error()
+        self.arm.clean_warn()
+        self.arm.motion_enable(enable=True)
+        # Restore whichever mode was active
+        if self.servo_active:
+            self.arm.set_mode(7)
+        else:
+            self.arm.set_mode(0)
+        self.arm.set_state(0)
+        time.sleep(0.1)
+        self.get_logger().info(f'Recovered from error {error_code}')
+        return True
+
     def clip_to_workspace(self, position: np.ndarray) -> np.ndarray:
         """
         Clip position to workspace bounds.
@@ -167,10 +198,11 @@ class XArmHandController(Node):
         Returns:
             Clipped position
         """
+        m = self.BOUNDARY_MARGIN
         clipped = np.array([
-            np.clip(position[0], self.x_min, self.x_max),
-            np.clip(position[1], self.y_min, self.y_max),
-            np.clip(position[2], self.z_min, self.z_max),
+            np.clip(position[0], self.x_min + m, self.x_max - m),
+            np.clip(position[1], self.y_min + m, self.y_max - m),
+            np.clip(position[2], self.z_min + m, self.z_max - m),
         ])
         return clipped
 
@@ -320,6 +352,11 @@ class XArmHandController(Node):
             self.target_position is None or not self.servo_active):
             return
 
+        # Recover from arm errors (e.g. safety boundary) before sending commands
+        if self.arm.error_code != 0:
+            self.recover_from_error()
+            return  # Skip this tick, resume next cycle
+
         try:
             # Target position in mm
             target_x_mm = self.target_position[0] * 1000.0
@@ -349,6 +386,10 @@ class XArmHandController(Node):
             self.target_position = None
 
             try:
+                # Clear any existing errors before reset
+                self.arm.clean_error()
+                self.arm.clean_warn()
+                self.arm.motion_enable(enable=True)
                 self.switch_to_position_mode()
 
                 # Home position (in mm and degrees)

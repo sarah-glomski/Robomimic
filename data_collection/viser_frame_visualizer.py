@@ -14,6 +14,8 @@ Displays:
 Access visualization at: http://localhost:8080
 """
 
+import os
+import json
 import collections
 import threading
 import numpy as np
@@ -63,7 +65,7 @@ class ViserFrameVisualizer(Node):
         # Parameters
         self.declare_parameter('viser_port', 8080)
         self.declare_parameter('workspace_x_min', 0.1)
-        self.declare_parameter('workspace_x_max', 0.5)
+        self.declare_parameter('workspace_x_max', 0.7)
         self.declare_parameter('workspace_y_min', -0.3)
         self.declare_parameter('workspace_y_max', 0.3)
         self.declare_parameter('workspace_z_min', 0.05)
@@ -210,14 +212,12 @@ class ViserFrameVisualizer(Node):
         self._hand_points_handle = None
         self._hand_skeleton_handle = None
 
-    def add_workspace_bounds(self):
-        """Add wireframe box showing workspace safety bounds."""
-        b = self.workspace_bounds
-        x_min, x_max = b['x_min'], b['x_max']
-        y_min, y_max = b['y_min'], b['y_max']
-        z_min, z_max = b['z_min'], b['z_max']
+    def _wireframe_box(self, name: str, bounds: dict, color: tuple, line_width: float = 2.0):
+        """Add a wireframe box to the scene."""
+        x_min, x_max = bounds['x_min'], bounds['x_max']
+        y_min, y_max = bounds['y_min'], bounds['y_max']
+        z_min, z_max = bounds['z_min'], bounds['z_max']
 
-        # Define the 8 corners of the box
         corners = np.array([
             [x_min, y_min, z_min],
             [x_max, y_min, z_min],
@@ -229,35 +229,97 @@ class ViserFrameVisualizer(Node):
             [x_min, y_max, z_max],
         ])
 
-        # Define the 12 edges of the box (pairs of corner indices)
         edges = [
-            # Bottom face
             (0, 1), (1, 2), (2, 3), (3, 0),
-            # Top face
             (4, 5), (5, 6), (6, 7), (7, 4),
-            # Vertical edges
             (0, 4), (1, 5), (2, 6), (3, 7),
         ]
 
-        # Create line segments for the wireframe
         points = np.array([[corners[i], corners[j]] for i, j in edges])
-        colors = np.array([[(100, 200, 200)] * 2 for _ in edges])
+        colors = np.array([[color] * 2 for _ in edges])
 
         self.server.scene.add_line_segments(
-            "/workspace_bounds",
+            name,
             points=points.astype(np.float32),
             colors=colors.astype(np.uint8),
-            line_width=2.0,
+            line_width=line_width,
         )
+
+    def add_workspace_bounds(self):
+        """Add wireframe boxes for robot and human workspace bounds."""
+        # Robot workspace (cyan)
+        self._wireframe_box("/workspace_bounds", self.workspace_bounds, (100, 200, 200))
+
+        # Human workspace: mirror robot bounds relative to human object position
+        # robot_target = robot_obj + (hand - human_obj)
+        # So hand = human_obj + (robot_target - robot_obj)
+        # human bounds = human_obj + (robot_bounds - robot_obj)
+        b = self.workspace_bounds
+        ro = self._robot_object_pos
+        ho = self._human_object_pos
+        human_bounds = {
+            'x_min': ho[0] + (b['x_min'] - ro[0]),
+            'x_max': ho[0] + (b['x_max'] - ro[0]),
+            'y_min': ho[1] + (b['y_min'] - ro[1]),
+            'y_max': ho[1] + (b['y_max'] - ro[1]),
+            'z_min': ho[2] + (b['z_min'] - ro[2]),
+            'z_max': ho[2] + (b['z_max'] - ro[2]),
+        }
+        self._wireframe_box("/human_workspace_bounds", human_bounds, (160, 80, 200))
+        self.server.scene.add_label("/human_workspace_bounds/label", text="Human Workspace")
+
+    def _load_camera_poses(self) -> dict:
+        """Load camera poses from camera_calibration.json, falling back to hardcoded."""
+        defaults = {
+            "head": {
+                "position": (0.28, 0.0, 1.02),
+                "wxyz": (0.0, 0.7071, 0.7071, 0.0),
+            },
+            "front": {
+                "position": (1.125, 0.0, 0.7),
+                "wxyz": (0.2706, -0.6533, -0.6533, 0.2706),
+            },
+        }
+
+        calib_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'camera_calibration.json'
+        )
+
+        if not os.path.exists(calib_path):
+            self.get_logger().info('No camera_calibration.json — using default camera poses')
+            return defaults
+
+        try:
+            with open(calib_path, 'r') as f:
+                calib = json.load(f)
+
+            result = dict(defaults)
+            for cam_name in ["head", "front"]:
+                entry = calib.get(f"{cam_name}_camera")
+                if entry is not None:
+                    pos = entry.get("camera_position_robot_frame")
+                    quat = entry.get("camera_quaternion_wxyz")
+                    if pos is not None and quat is not None:
+                        result[cam_name] = {
+                            "position": tuple(pos),
+                            "wxyz": tuple(quat),
+                        }
+                        self.get_logger().info(f'Loaded {cam_name} camera pose from calibration')
+
+            return result
+
+        except Exception as e:
+            self.get_logger().warn(f'Failed to load calibration: {e} — using defaults')
+            return defaults
 
     def add_camera_frustums(self):
         """Add camera frustum visualizations for head and front cameras."""
         cam_fov = 0.733   # ~42 deg vertical FOV (RealSense D435)
         cam_aspect = 640.0 / 360.0
 
-        # Head camera: overhead, rotated -45 deg about Z from (0.3, 0, 0.8)
-        # Base: 180-deg about X (down-facing), then -45 deg about Z
-        # quaternion wxyz = (0, 0.9239, -0.3827, 0)
+        poses = self._load_camera_poses()
+
         self.server.scene.add_camera_frustum(
             "/cameras/head",
             fov=cam_fov,
@@ -265,17 +327,14 @@ class ViserFrameVisualizer(Node):
             scale=0.08,
             line_width=2.0,
             color=(100, 180, 255),
-            wxyz=(0.0, 0.7071, 0.7071, 0.0),
-            position=(0.28, 0.0, 1.02),
+            wxyz=poses["head"]["wxyz"],
+            position=poses["head"]["position"],
         )
         self.server.scene.add_label(
             "/cameras/head/label",
             text="Head Cam",
         )
 
-        # Front camera: flipped 180 deg about Z to opposite side of workspace,
-        # facing toward robot base, angled 45 deg below horizon toward -X
-        # quaternion wxyz = (0.2706, -0.6533, -0.6533, 0.2706)
         self.server.scene.add_camera_frustum(
             "/cameras/front",
             fov=cam_fov,
@@ -283,8 +342,8 @@ class ViserFrameVisualizer(Node):
             scale=0.08,
             line_width=2.0,
             color=(255, 180, 100),
-            wxyz=(0.2706, -0.6533, -0.6533, 0.2706),
-            position=(1.125, 0.0, 0.7),
+            wxyz=poses["front"]["wxyz"],
+            position=poses["front"]["position"],
         )
         self.server.scene.add_label(
             "/cameras/front/label",
