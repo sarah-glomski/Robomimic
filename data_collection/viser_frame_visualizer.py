@@ -69,10 +69,10 @@ class ViserFrameVisualizer(Node):
         self.declare_parameter('workspace_y_max', 0.3)
         self.declare_parameter('workspace_z_min', 0.05)
         self.declare_parameter('workspace_z_max', 0.4)
-        self.declare_parameter('human_object_x', 0.3)
-        self.declare_parameter('human_object_y', -0.35)
+        self.declare_parameter('human_object_x', 0.365)
+        self.declare_parameter('human_object_y', -0.36)
         self.declare_parameter('human_object_z', 0.0)
-        self.declare_parameter('robot_object_x', 0.3)
+        self.declare_parameter('robot_object_x', 0.365)
         self.declare_parameter('robot_object_y', 0.0)
         self.declare_parameter('robot_object_z', 0.0)
 

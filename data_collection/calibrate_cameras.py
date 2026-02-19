@@ -59,7 +59,7 @@ CAMERAS = {
 }
 
 XARM_IP = "192.168.1.219"
-TCP_OFFSET_Z_MM = 100.0  # Must match xarm_hand_controller.py
+TCP_OFFSET_Z_MM = 172.0  # Actual flange-to-gripper-tip distance
 
 
 class CalibrationNode(Node):
@@ -429,10 +429,10 @@ def main():
     # ordering depends on image orientation, so we must try row/col flips too.
     grid = corners_3d.reshape(args.rows, args.cols, 3)
     corners_3d_variants = [
-        # ("original",  corners_3d),
+        ("original",  corners_3d),
         ("col_flip",  grid[:, ::-1, :].reshape(-1, 3).copy()),
-        # ("row_flip",  grid[::-1, :, :].reshape(-1, 3).copy()),
-        # ("both_flip", corners_3d[::-1].copy()),
+        ("row_flip",  grid[::-1, :, :].reshape(-1, 3).copy()),
+        ("both_flip", corners_3d[::-1].copy()),
     ]
     board_z = np.mean(corners_3d[:, 2])
 
@@ -492,18 +492,24 @@ def main():
                 print(f"    solvePnP failed for all orderings — skipping.")
                 continue
 
-            # Prefer solutions where camera is above the board
+            # Print ALL candidates so user can verify against physical measurement
             valid = [c for c in candidates
                      if c["camera_position_robot_frame"][2] > board_z]
+            print(f"    All solutions (camera above board):")
+            for c in candidates:
+                pos = c["camera_position_robot_frame"]
+                above = "above" if pos[2] > board_z else "BELOW"
+                print(f"      {c['_label']:>10s}: "
+                      f"pos=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] "
+                      f"err={c['reprojection_error_px']:.2f}px  ({above})")
+
             if valid:
                 result = min(valid, key=lambda c: c["reprojection_error_px"])
             else:
                 result = min(candidates, key=lambda c: c["reprojection_error_px"])
-                print(f"    WARNING: No solution has camera above board "
-                      f"(best z={result['camera_position_robot_frame'][2]:.3f})")
+                print(f"    WARNING: No solution has camera above board")
 
-            if result["_label"] != "original":
-                print(f"    (Used {result['_label']} corner ordering)")
+            print(f"    >>> Selected: {result['_label']}")
             del result["_label"]
 
             cam_results[cam_name] = result

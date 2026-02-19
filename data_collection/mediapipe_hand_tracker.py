@@ -46,9 +46,9 @@ class MediaPipeHandTracker(Node):
 
         # Parameters
         self.declare_parameter('position_scale', 0.3)
-        self.declare_parameter('position_offset_x', 0.3)
+        self.declare_parameter('position_offset_x', 0.0)
         self.declare_parameter('position_offset_y', 0.0)
-        self.declare_parameter('position_offset_z', 0.2)
+        self.declare_parameter('position_offset_z', 0.0)
         self.declare_parameter('filter_alpha', 0.3)
         self.declare_parameter('detection_confidence', 0.2)
         self.declare_parameter('tracking_confidence', 0.15)
@@ -62,10 +62,10 @@ class MediaPipeHandTracker(Node):
 
         # Object-relative transform parameters
         self.declare_parameter('use_object_relative', True)
-        self.declare_parameter('human_object_x', 0.3)
-        self.declare_parameter('human_object_y', -0.35)
+        self.declare_parameter('human_object_x', 0.365)
+        self.declare_parameter('human_object_y', -0.36)
         self.declare_parameter('human_object_z', 0.0)
-        self.declare_parameter('robot_object_x', 0.3)
+        self.declare_parameter('robot_object_x', 0.365)
         self.declare_parameter('robot_object_y', 0.0)
         self.declare_parameter('robot_object_z', 0.0)
 
@@ -136,7 +136,7 @@ class MediaPipeHandTracker(Node):
 
         # QoS for camera streams
         sensor_qos = QoSProfile(
-            depth=10,
+            depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST
         )
@@ -144,8 +144,6 @@ class MediaPipeHandTracker(Node):
         # Depth mode state
         self._depth_mode_active = False  # True once synced frames start arriving
         self._fell_back_to_color = False  # True if auto-fallback triggered
-        self._depth_diag_color_count = 0
-        self._depth_diag_depth_count = 0
         self._sync_count = 0
 
         if self._use_depth:
@@ -172,27 +170,12 @@ class MediaPipeHandTracker(Node):
             )
             self.time_sync = message_filters.ApproximateTimeSynchronizer(
                 [self.color_sub, self.depth_sub],
-                queue_size=30,
+                queue_size=5,
                 slop=0.1,
             )
             self.time_sync.registerCallback(self.synced_image_callback)
 
-            # Diagnostic: independent subscribers to count raw arrivals
-            self._diag_color_sub = self.create_subscription(
-                Image,
-                '/rs_head/rs_head/color/image_raw',
-                self._diag_color_callback,
-                sensor_qos
-            )
-            self._diag_depth_sub = self.create_subscription(
-                Image,
-                '/rs_head/rs_head/aligned_depth_to_color/image_raw',
-                self._diag_depth_callback,
-                sensor_qos
-            )
-
-            # Watchdog: diagnose after 5s, auto-fallback after 10s
-            self._sync_watchdog = self.create_timer(5.0, self._sync_watchdog_callback)
+            # Auto-fallback to color-only if sync doesn't work within 10s
             self._fallback_timer = self.create_timer(10.0, self._auto_fallback_callback)
 
             self.get_logger().info('Depth mode enabled - waiting for aligned depth + camera_info')
@@ -271,50 +254,12 @@ class MediaPipeHandTracker(Node):
             self.get_logger().warn(f'Failed to load calibration: {e} — using hardcoded')
             return default_rotation, default_translation
 
-    def _diag_color_callback(self, msg):
-        """Count color messages for diagnostics."""
-        self._depth_diag_color_count += 1
-
-    def _diag_depth_callback(self, msg):
-        """Count depth messages for diagnostics."""
-        self._depth_diag_depth_count += 1
-
-    def _sync_watchdog_callback(self):
-        """Log diagnostic if synced frames aren't arriving."""
-        if self._sync_count > 0:
-            # All good, cancel watchdog
-            self._sync_watchdog.cancel()
-            return
-
-        self.get_logger().warn(
-            f'No synced color+depth frames yet. '
-            f'Color msgs: {self._depth_diag_color_count}, '
-            f'Depth msgs: {self._depth_diag_depth_count}, '
-            f'intrinsics: {self._intrinsics_received}'
-        )
-
-        if self._depth_diag_depth_count == 0 and self._depth_diag_color_count > 0:
-            self.get_logger().warn(
-                'Aligned depth topic is NOT publishing. Check with:\n'
-                '  ros2 topic list | grep depth\n'
-                'The topic should be: /rs_head/rs_head/aligned_depth_to_color/image_raw\n'
-                'Auto-fallback to color-only mode will trigger in a few seconds.'
-            )
-        elif self._depth_diag_depth_count > 0 and self._depth_diag_color_count > 0:
-            self.get_logger().warn(
-                'Both topics are publishing but sync is failing. '
-                'This may be a timestamp mismatch between color and depth streams.'
-            )
-
     def _auto_fallback_callback(self):
         """Auto-fallback to color-only mode if sync never works."""
         self._fallback_timer.cancel()
 
         if self._sync_count > 0:
-            # Depth mode working, clean up diagnostics
-            self._sync_watchdog.cancel()
-            self.destroy_subscription(self._diag_color_sub)
-            self.destroy_subscription(self._diag_depth_sub)
+            # Depth mode working
             self._depth_mode_active = True
             return
 
@@ -326,7 +271,7 @@ class MediaPipeHandTracker(Node):
 
         # Subscribe to color-only for the original image_callback
         sensor_qos = QoSProfile(
-            depth=10,
+            depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST
         )
@@ -336,7 +281,6 @@ class MediaPipeHandTracker(Node):
             self.image_callback,
             sensor_qos
         )
-        self._sync_watchdog.cancel()
 
     def camera_info_callback(self, msg: CameraInfo):
         """Extract camera intrinsics from camera_info (one-shot)."""
