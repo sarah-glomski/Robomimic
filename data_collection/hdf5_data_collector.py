@@ -207,17 +207,17 @@ class HDF5DataCollector(Node):
 
     def pause_collection(self):
         """Pause data collection and robot motion."""
-        if self.is_collecting and not self.is_paused:
+        if not self.is_paused:
             self.is_paused = True
             self.pause_pub.publish(Bool(data=True))
-            self.get_logger().info('Paused recording')
+            self.get_logger().info('Paused')
 
     def unpause_collection(self):
         """Resume data collection and robot motion."""
-        if self.is_collecting and self.is_paused:
+        if self.is_paused:
             self.is_paused = False
             self.pause_pub.publish(Bool(data=False))
-            self.get_logger().info('Resumed recording')
+            self.get_logger().info('Resumed')
 
     def reset_robot(self):
         """Send reset command to robot."""

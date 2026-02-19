@@ -47,7 +47,7 @@ class MediaPipeHandTracker(Node):
         # Parameters
         self.declare_parameter('position_scale', 0.3)
         self.declare_parameter('position_offset_x', 0.0)
-        self.declare_parameter('position_offset_y', 0.0)
+        self.declare_parameter('position_offset_y', 0.3)
         self.declare_parameter('position_offset_z', 0.0)
         self.declare_parameter('filter_alpha', 0.3)
         self.declare_parameter('detection_confidence', 0.2)
@@ -68,6 +68,11 @@ class MediaPipeHandTracker(Node):
         self.declare_parameter('robot_object_x', 0.365)
         self.declare_parameter('robot_object_y', 0.0)
         self.declare_parameter('robot_object_z', 0.0)
+
+        # Final position offset for fine-tuning hand-to-gripper alignment (meters)
+        self.declare_parameter('fine_offset_x', 0.0)
+        self.declare_parameter('fine_offset_y', 0.02)
+        self.declare_parameter('fine_offset_z', 0.1)
 
         position_scale = self.get_parameter('position_scale').value
         position_offset = np.array([
@@ -96,6 +101,11 @@ class MediaPipeHandTracker(Node):
             self.get_parameter('robot_object_x').value,
             self.get_parameter('robot_object_y').value,
             self.get_parameter('robot_object_z').value,
+        ])
+        self._fine_offset = np.array([
+            self.get_parameter('fine_offset_x').value,
+            self.get_parameter('fine_offset_y').value,
+            self.get_parameter('fine_offset_z').value,
         ])
 
         # Initialize MediaPipe Hands
@@ -210,6 +220,9 @@ class MediaPipeHandTracker(Node):
                 f'Object-relative transform: human={self._human_object_pos}, '
                 f'robot={self._robot_object_pos}'
             )
+        if np.any(self._fine_offset != 0):                          
+            self.get_logger().info(f'Fine offset: {self._fine_offset}')   
+
 
     def _load_head_camera_extrinsics(self):
         """
@@ -645,6 +658,7 @@ class MediaPipeHandTracker(Node):
             target = self._robot_object_pos + delta
         else:
             target = position
+        target = target + self._fine_offset
 
         target_msg = PoseStamped()
         target_msg.header.stamp = stamp
