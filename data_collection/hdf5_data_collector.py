@@ -45,10 +45,6 @@ class HDF5DataCollector(Node):
 
         self.get_logger().info('Initializing HDF5 Data Collector...')
 
-        # Latency offset metadata (mirrors controller's parameter)
-        self.declare_parameter('latency_offset', 0.0)
-        self._latency_offset = self.get_parameter('latency_offset').value
-
         self._bridge = CvBridge()
 
         # QoS for camera streams
@@ -276,7 +272,6 @@ class HDF5DataCollector(Node):
             f.attrs['num_frames'] = len(action_pose)
             f.attrs['collection_rate_hz'] = 30
             f.attrs['episode_index'] = self.demo_count
-            f.attrs['latency_offset_sec'] = self._latency_offset
 
         self.get_logger().info(f'Saved episode to {filename}')
 
