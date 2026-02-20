@@ -47,14 +47,14 @@ class XArmHandController(Node):
         self.z_min = self.declare_parameter('workspace_z_min', 0.05).value
         self.z_max = self.declare_parameter('workspace_z_max', 0.4).value
 
-        # Fixed orientation (pointing down): roll=180deg, pitch=0, yaw=0
+        # EEF orientation: roll/pitch are fixed, yaw offset adds to tracked hand yaw
         self.fixed_roll = self.declare_parameter('fixed_roll_deg', 180.0).value
         self.fixed_pitch = self.declare_parameter('fixed_pitch_deg', 0.0).value
-        self.fixed_yaw = self.declare_parameter('fixed_yaw_deg', 0.0).value
+        self.fixed_yaw_offset = self.declare_parameter('fixed_yaw_offset_deg', 0.0).value
 
-        # Yaw limits (applied to hand-tracked yaw + fixed_yaw offset)
-        self.yaw_min_deg = self.declare_parameter('yaw_min_deg', -120.0).value
-        self.yaw_max_deg = self.declare_parameter('yaw_max_deg', 120.0).value
+        # Yaw deviation limits (max hand rotation from fixed_yaw_offset center)
+        self.yaw_dev_min_deg = self.declare_parameter('yaw_dev_min_deg', -360.0).value
+        self.yaw_dev_max_deg = self.declare_parameter('yaw_dev_max_deg', 360.0).value
 
         # TCP offset: vertical offset from flange to gripper contact point (mm)
         self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 0.0).value
@@ -67,7 +67,7 @@ class XArmHandController(Node):
 
         # Control state
         self.target_position = None  # Target XYZ in meters
-        self.target_yaw = math.radians(self.fixed_yaw)  # Target yaw in radians
+        self.target_yaw = math.radians(self.fixed_yaw_offset)  # Target yaw in radians
         self.gripper_cmd = 0.0  # 0 = open, 1 = closed
         self.is_paused = False
         self.is_resetting = False
@@ -206,7 +206,7 @@ class XArmHandController(Node):
         if was_active and not self.hand_tracking_active:
             # Hand tracking lost - stop robot (safety)
             self.target_position = None
-            self.target_yaw = math.radians(self.fixed_yaw)
+            self.target_yaw = math.radians(self.fixed_yaw_offset)
 
     def hand_pose_callback(self, msg: PoseStamped):
         """Receive hand pose and update target position and yaw."""
@@ -223,12 +223,24 @@ class XArmHandController(Node):
 
             # Extract hand yaw from Z-rotation quaternion
             o = msg.pose.orientation
-            hand_yaw = math.atan2(2.0 * (o.w * o.z + o.x * o.y),
-                                  1.0 - 2.0 * (o.y * o.y + o.z * o.z))
-            # Add fixed_yaw offset and clamp to limits
-            yaw = math.radians(self.fixed_yaw) + hand_yaw
-            yaw = max(math.radians(self.yaw_min_deg),
-                      min(math.radians(self.yaw_max_deg), yaw))
+            hand_yaw_raw = math.atan2(2.0 * (o.w * o.z + o.x * o.y),
+                                      1.0 - 2.0 * (o.y * o.y + o.z * o.z))
+            # Clamp hand yaw deviation before adding offset (avoids atan2 discontinuity)
+            dev_min = math.radians(self.yaw_dev_min_deg)
+            dev_max = math.radians(self.yaw_dev_max_deg)
+            hand_yaw = max(dev_min, min(dev_max, hand_yaw_raw))
+            if hand_yaw != hand_yaw_raw:
+                self.get_logger().warn(
+                    f'Hand yaw clipped: {math.degrees(hand_yaw_raw):.1f}deg '
+                    f'-> {math.degrees(hand_yaw):.1f}deg '
+                    f'(limits [{self.yaw_dev_min_deg}, {self.yaw_dev_max_deg}])')
+            # Add fixed_yaw offset and normalize to [-π, π]
+            yaw_raw = math.radians(self.fixed_yaw_offset) + hand_yaw
+            yaw = math.atan2(math.sin(yaw_raw), math.cos(yaw_raw))
+            if abs(yaw - yaw_raw) > 0.01:
+                self.get_logger().warn(
+                    f'Yaw normalized: {math.degrees(yaw_raw):.1f}deg '
+                    f'-> {math.degrees(yaw):.1f}deg')
 
             # Apply workspace bounds
             clipped = self.clip_to_workspace(position)
@@ -341,7 +353,7 @@ class XArmHandController(Node):
                 # Home position (in mm and degrees)
                 code = self.arm.set_position(
                     x=200.0, y=0.0, z=250.0,
-                    roll=180.0, pitch=0.0, yaw=0.0,
+                    roll=180.0, pitch=0.0, yaw=180.0,
                     speed=100, is_radian=False, wait=True
                 )
 
