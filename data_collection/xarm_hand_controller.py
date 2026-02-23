@@ -269,9 +269,15 @@ class XArmHandController(Node):
             grasp = 850 - 850 * self.gripper_cmd
             self.arm.set_gripper_position(int(grasp), wait=False)
 
-            # Publish action for data collection
+            # Read back actual gripper position so the recorded action
+            # reflects the real width (e.g. stopped by an object) rather
+            # than the raw hand-tracking command.
             gripper_msg = Float32()
-            gripper_msg.data = self.gripper_cmd
+            code, actual_pos = self.arm.get_gripper_position()
+            if code == 0:
+                gripper_msg.data = max(0.0, min(1.0, (850.0 - actual_pos) / 850.0))
+            else:
+                gripper_msg.data = self.gripper_cmd  # fallback to command
             self.action_gripper_pub.publish(gripper_msg)
 
         except Exception as e:
