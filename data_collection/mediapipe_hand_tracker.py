@@ -90,8 +90,8 @@ class MediaPipeHandTracker(Node):
         # Handedness: 'right' uses the defaults above; 'left' swaps in overrides.
         # Only yaw and fine_offset_y differ between hands (x/z are the same).
         self.declare_parameter('handedness', 'right')
-        self.declare_parameter('left_hand_yaw_offset_deg', -90.0)
-        self.declare_parameter('left_fine_offset_y', -0.02)
+        self.declare_parameter('left_hand_yaw_offset_deg', -60.0)
+        self.declare_parameter('left_fine_offset_y', -0.05)
 
         # Depth parameters
         self.declare_parameter('use_depth', True)
