@@ -13,11 +13,14 @@ Supports two modes:
   to produce accurate metric 3D hand positions in robot frame via known extrinsics.
 - Fallback (use_depth=False): Uses MediaPipe's normalized landmark coordinates with
   heuristic scaling (original behavior).
+
+Optionally fuses hand tracking from both head and front cameras (use_front_camera=True).
 """
 
 import os
 import json
 import math
+import time
 import numpy as np
 import cv2
 import mediapipe as mp
@@ -35,6 +38,35 @@ from utils.hand_to_action import HandToActionTransformer, get_hand_tracking_stat
 
 # Palm landmark indices (wrist + 4 MCP knuckles)
 PALM_INDICES = [0, 5, 9, 13, 17]
+
+# Max age (seconds) for a camera result to be considered valid for fusion
+FUSION_STALENESS_S = 0.15
+
+
+class CameraState:
+    """Per-camera state for intrinsics, extrinsics, filters, and latest result."""
+    def __init__(self, name: str, rotation: np.ndarray, translation: np.ndarray, filter_alpha: float):
+        self.name = name
+        # Intrinsics (populated from camera_info)
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
+        self.intrinsics_received = False
+        # Extrinsics
+        self.cam_to_robot_rotation = rotation
+        self.cam_to_robot_translation = translation
+        # Sync state
+        self.sync_count = 0
+        # Per-camera low-pass filters
+        from utils.hand_to_action import LowPassFilter
+        self.position_filter = LowPassFilter(alpha=filter_alpha)
+        self.yaw_filter = LowPassFilter(alpha=filter_alpha)
+        # Latest detection result
+        self.latest_position = None  # np.ndarray (3,) in robot frame
+        self.latest_yaw = None       # float, radians
+        self.latest_time = None      # float, time.monotonic()
+        self.latest_landmarks = None # MediaPipe landmarks (for gripper/landmarks publishing)
 
 
 class MediaPipeHandTracker(Node):
@@ -55,10 +87,19 @@ class MediaPipeHandTracker(Node):
 
         self.declare_parameter('hand_yaw_offset_deg', -90.0)
 
+        # Handedness: 'right' uses the defaults above; 'left' swaps in overrides.
+        # Only yaw and fine_offset_y differ between hands (x/z are the same).
+        self.declare_parameter('handedness', 'right')
+        self.declare_parameter('left_hand_yaw_offset_deg', -60.0)
+        self.declare_parameter('left_fine_offset_y', -0.05)
+
         # Depth parameters
         self.declare_parameter('use_depth', True)
         self.declare_parameter('max_valid_depth_m', 1.5)
         self.declare_parameter('min_valid_depth_m', 0.1)
+
+        # Front camera fusion (disabled by default)
+        self.declare_parameter('use_front_camera', True)
 
         # Object-relative transform parameters
         self.declare_parameter('use_object_relative', True)
@@ -72,6 +113,7 @@ class MediaPipeHandTracker(Node):
         # Final position offset for fine-tuning hand-to-gripper alignment (meters)
         self.declare_parameter('fine_offset_x', 0.0)
         self.declare_parameter('fine_offset_y', 0.02)
+        # use 0.172 for full gripper height, 0.08 for grasping from top
         self.declare_parameter('fine_offset_z', 0.08)
 
         position_scale = self.get_parameter('position_scale').value
@@ -84,11 +126,18 @@ class MediaPipeHandTracker(Node):
         detection_conf = self.get_parameter('detection_confidence').value
         tracking_conf = self.get_parameter('tracking_confidence').value
 
-        self._hand_yaw_offset = math.radians(self.get_parameter('hand_yaw_offset_deg').value)
+        self._handedness = self.get_parameter('handedness').value
+        if self._handedness == 'left':
+            self._hand_yaw_offset = math.radians(
+                self.get_parameter('left_hand_yaw_offset_deg').value)
+        else:
+            self._hand_yaw_offset = math.radians(
+                self.get_parameter('hand_yaw_offset_deg').value)
 
         self._use_depth = self.get_parameter('use_depth').value
         self._max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
         self._min_valid_depth_m = self.get_parameter('min_valid_depth_m').value
+        self._use_front_camera = self.get_parameter('use_front_camera').value
 
         # Object-relative transform
         self._use_object_relative = self.get_parameter('use_object_relative').value
@@ -102,15 +151,24 @@ class MediaPipeHandTracker(Node):
             self.get_parameter('robot_object_y').value,
             self.get_parameter('robot_object_z').value,
         ])
+        if self._handedness == 'left':
+            fine_offset_y = self.get_parameter('left_fine_offset_y').value
+        else:
+            fine_offset_y = self.get_parameter('fine_offset_y').value
+
         self._fine_offset = np.array([
             self.get_parameter('fine_offset_x').value,
-            self.get_parameter('fine_offset_y').value,
+            fine_offset_y,
             self.get_parameter('fine_offset_z').value,
         ])
 
-        # Initialize MediaPipe Hands
+        self.get_logger().info(f'Handedness: {self._handedness} | '
+            f'yaw_offset={math.degrees(self._hand_yaw_offset):.1f}deg | '
+            f'fine_offset={self._fine_offset}')
+
+        # Initialize MediaPipe Hands (one per camera stream for independent tracking state)
         self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
+        self._hands_head = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
             min_detection_confidence=detection_conf,
@@ -128,21 +186,25 @@ class MediaPipeHandTracker(Node):
         # CV bridge for image conversion
         self._bridge = CvBridge()
 
-        # Camera intrinsics (populated from camera_info)
-        self._fx = None
-        self._fy = None
-        self._cx = None
-        self._cy = None
-        self._intrinsics_received = False
+        # Camera states
+        head_rot, head_trans = self._load_camera_extrinsics('head_camera')
+        self._head = CameraState('head', head_rot, head_trans, filter_alpha)
 
-        # Camera-to-robot extrinsics (loaded from calibration file or hardcoded fallback)
-        self._cam_to_robot_rotation, self._cam_to_robot_translation = \
-            self._load_head_camera_extrinsics()
+        self._front = None
+        if self._use_front_camera:
+            front_rot, front_trans = self._load_camera_extrinsics('front_camera')
+            self._front = CameraState('front', front_rot, front_trans, filter_alpha)
+            self._hands_front = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                min_detection_confidence=detection_conf,
+                min_tracking_confidence=tracking_conf
+            )
 
-        # Low-pass filters for depth-based position and yaw
+        # Fused position filter (applied after averaging camera results)
         from utils.hand_to_action import LowPassFilter
-        self._depth_position_filter = LowPassFilter(alpha=filter_alpha)
-        self._yaw_filter = LowPassFilter(alpha=filter_alpha)
+        self._fused_position_filter = LowPassFilter(alpha=filter_alpha)
+        self._fused_yaw_filter = LowPassFilter(alpha=filter_alpha)
 
         # QoS for camera streams
         sensor_qos = QoSProfile(
@@ -152,43 +214,71 @@ class MediaPipeHandTracker(Node):
         )
 
         # Depth mode state
-        self._depth_mode_active = False  # True once synced frames start arriving
-        self._fell_back_to_color = False  # True if auto-fallback triggered
-        self._sync_count = 0
+        self._fell_back_to_color = False
 
         if self._use_depth:
-            # Subscribe to camera_info (one-shot for intrinsics)
-            self.camera_info_sub = self.create_subscription(
+            # Head camera subscriptions
+            self._head_info_sub = self.create_subscription(
                 CameraInfo,
                 '/rs_head/rs_head/color/camera_info',
-                self.camera_info_callback,
+                lambda msg: self._camera_info_callback(msg, self._head),
                 sensor_qos
             )
-
-            # Synchronized color + depth subscription
-            # Use raw Image (not compressed) because enable_sync mode
-            # doesn't reliably publish the compressed transport variant
-            self.color_sub = message_filters.Subscriber(
+            self._head_color_sub = message_filters.Subscriber(
                 self, Image,
                 '/rs_head/rs_head/color/image_raw',
                 qos_profile=sensor_qos
             )
-            self.depth_sub = message_filters.Subscriber(
+            self._head_depth_sub = message_filters.Subscriber(
                 self, Image,
                 '/rs_head/rs_head/aligned_depth_to_color/image_raw',
                 qos_profile=sensor_qos
             )
-            self.time_sync = message_filters.ApproximateTimeSynchronizer(
-                [self.color_sub, self.depth_sub],
+            self._head_sync = message_filters.ApproximateTimeSynchronizer(
+                [self._head_color_sub, self._head_depth_sub],
                 queue_size=30,
                 slop=0.1,
             )
-            self.time_sync.registerCallback(self.synced_image_callback)
+            self._head_sync.registerCallback(
+                lambda color, depth: self._synced_callback(color, depth, self._head, self._hands_head)
+            )
+            self._head_fallback_timer = self.create_timer(
+                10.0, lambda: self._auto_fallback_callback(self._head)
+            )
 
-            # Auto-fallback to color-only if sync doesn't work within 10s
-            self._fallback_timer = self.create_timer(10.0, self._auto_fallback_callback)
+            # Front camera subscriptions (only if enabled)
+            if self._use_front_camera:
+                self._front_info_sub = self.create_subscription(
+                    CameraInfo,
+                    '/rs_front/rs_front/color/camera_info',
+                    lambda msg: self._camera_info_callback(msg, self._front),
+                    sensor_qos
+                )
+                self._front_color_sub = message_filters.Subscriber(
+                    self, Image,
+                    '/rs_front/rs_front/color/image_raw',
+                    qos_profile=sensor_qos
+                )
+                self._front_depth_sub = message_filters.Subscriber(
+                    self, Image,
+                    '/rs_front/rs_front/aligned_depth_to_color/image_raw',
+                    qos_profile=sensor_qos
+                )
+                self._front_sync = message_filters.ApproximateTimeSynchronizer(
+                    [self._front_color_sub, self._front_depth_sub],
+                    queue_size=30,
+                    slop=0.1,
+                )
+                self._front_sync.registerCallback(
+                    lambda color, depth: self._synced_callback(color, depth, self._front, self._hands_front)
+                )
+                self._front_fallback_timer = self.create_timer(
+                    10.0, lambda: self._auto_fallback_callback(self._front)
+                )
 
             self.get_logger().info('Depth mode enabled - waiting for aligned depth + camera_info')
+            if self._use_front_camera:
+                self.get_logger().info('Front camera fusion enabled')
         else:
             # Fallback: subscribe to raw color only (original behavior)
             self.image_sub = self.create_subscription(
@@ -220,14 +310,17 @@ class MediaPipeHandTracker(Node):
                 f'Object-relative transform: human={self._human_object_pos}, '
                 f'robot={self._robot_object_pos}'
             )
-        if np.any(self._fine_offset != 0):                          
-            self.get_logger().info(f'Fine offset: {self._fine_offset}')   
+        if np.any(self._fine_offset != 0):
+            self.get_logger().info(f'Fine offset: {self._fine_offset}')
 
 
-    def _load_head_camera_extrinsics(self):
+    def _load_camera_extrinsics(self, camera_key: str):
         """
-        Load head camera extrinsics from camera_calibration.json if it exists.
+        Load camera extrinsics from camera_calibration.json.
         Falls back to hardcoded defaults if file not found.
+
+        Args:
+            camera_key: 'head_camera' or 'front_camera'
         """
         default_rotation = np.array([
             [0.0, 1.0, 0.0],
@@ -242,74 +335,75 @@ class MediaPipeHandTracker(Node):
         )
 
         if not os.path.exists(calib_path):
-            self.get_logger().info('No camera_calibration.json — using hardcoded extrinsics')
+            self.get_logger().info(f'No camera_calibration.json — using hardcoded extrinsics for {camera_key}')
             return default_rotation, default_translation
 
         try:
             with open(calib_path, 'r') as f:
                 calib = json.load(f)
 
-            head = calib.get('head_camera')
-            if head is None:
-                self.get_logger().warn('camera_calibration.json missing head_camera — using hardcoded')
+            cam = calib.get(camera_key)
+            if cam is None:
+                self.get_logger().warn(f'camera_calibration.json missing {camera_key} — using hardcoded')
                 return default_rotation, default_translation
 
-            rotation = np.array(head['rotation_cam_to_robot'], dtype=np.float64)
-            translation = np.array(head['translation_cam_to_robot'], dtype=np.float64)
+            rotation = np.array(cam['rotation_cam_to_robot'], dtype=np.float64)
+            translation = np.array(cam['translation_cam_to_robot'], dtype=np.float64)
 
-            self.get_logger().info(f'Loaded head camera extrinsics from {calib_path}')
+            self.get_logger().info(f'Loaded {camera_key} extrinsics from {calib_path}')
             self.get_logger().info(
                 f'  Translation: [{translation[0]:.4f}, {translation[1]:.4f}, {translation[2]:.4f}]'
             )
             return rotation, translation
 
         except Exception as e:
-            self.get_logger().warn(f'Failed to load calibration: {e} — using hardcoded')
+            self.get_logger().warn(f'Failed to load {camera_key} calibration: {e} — using hardcoded')
             return default_rotation, default_translation
 
-    def _auto_fallback_callback(self):
-        """Auto-fallback to color-only mode if sync never works."""
-        self._fallback_timer.cancel()
+    def _auto_fallback_callback(self, cam: CameraState):
+        """Auto-fallback to color-only mode if sync never works for a camera."""
+        # Cancel timer (only fires once per camera)
+        if cam.name == 'head':
+            self._head_fallback_timer.cancel()
+        elif cam.name == 'front':
+            self._front_fallback_timer.cancel()
 
-        if self._sync_count > 0:
-            # Depth mode working
-            self._depth_mode_active = True
+        if cam.sync_count > 0:
             return
 
         self.get_logger().warn(
-            'Auto-fallback: switching to color-only mode (no depth sync after 10s). '
-            'Hand tracking will use MediaPipe normalized coordinates.'
-        )
-        self._fell_back_to_color = True
-
-        # Subscribe to color-only for the original image_callback
-        sensor_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST
-        )
-        self.image_sub = self.create_subscription(
-            Image,
-            '/rs_head/rs_head/color/image_raw',
-            self.image_callback,
-            sensor_qos
+            f'Auto-fallback: {cam.name} camera — no depth sync after 10s.'
         )
 
-    def camera_info_callback(self, msg: CameraInfo):
-        """Extract camera intrinsics from camera_info (one-shot)."""
-        if self._intrinsics_received:
+        if cam.name == 'head':
+            # Head camera falls back to color-only
+            self._fell_back_to_color = True
+            sensor_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST
+            )
+            self.image_sub = self.create_subscription(
+                Image,
+                '/rs_head/rs_head/color/image_raw',
+                self.image_callback,
+                sensor_qos
+            )
+
+    def _camera_info_callback(self, msg: CameraInfo, cam: CameraState):
+        """Extract camera intrinsics from camera_info (one-shot per camera)."""
+        if cam.intrinsics_received:
             return
 
-        # K matrix is 3x3 row-major: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
-        self._fx = msg.k[0]
-        self._fy = msg.k[4]
-        self._cx = msg.k[2]
-        self._cy = msg.k[5]
-        self._intrinsics_received = True
+        cam.fx = msg.k[0]
+        cam.fy = msg.k[4]
+        cam.cx = msg.k[2]
+        cam.cy = msg.k[5]
+        cam.intrinsics_received = True
 
         self.get_logger().info(
-            f'Camera intrinsics received: fx={self._fx:.1f}, fy={self._fy:.1f}, '
-            f'cx={self._cx:.1f}, cy={self._cy:.1f}'
+            f'{cam.name} camera intrinsics: fx={cam.fx:.1f}, fy={cam.fy:.1f}, '
+            f'cx={cam.cx:.1f}, cy={cam.cy:.1f}'
         )
 
     def _sample_depth_patch(self, depth_image: np.ndarray, u: int, v: int) -> float:
@@ -345,46 +439,24 @@ class MediaPipeHandTracker(Node):
 
         return depth_m
 
-    def _backproject_to_camera_frame(self, u: float, v: float, depth_m: float) -> np.ndarray:
-        """
-        Backproject a pixel (u, v) with depth to 3D point in camera frame.
-
-        Args:
-            u: Pixel column
-            v: Pixel row
-            depth_m: Depth in meters
-
-        Returns:
-            np.ndarray (3,): 3D point in camera frame [X, Y, Z]
-        """
-        x_cam = (u - self._cx) / self._fx * depth_m
-        y_cam = (v - self._cy) / self._fy * depth_m
+    def _backproject_to_camera_frame(self, u: float, v: float, depth_m: float,
+                                      cam: CameraState) -> np.ndarray:
+        """Backproject a pixel (u, v) with depth to 3D point in camera frame."""
+        x_cam = (u - cam.cx) / cam.fx * depth_m
+        y_cam = (v - cam.cy) / cam.fy * depth_m
         z_cam = depth_m
         return np.array([x_cam, y_cam, z_cam])
 
-    def _camera_to_robot_frame(self, point_cam: np.ndarray) -> np.ndarray:
-        """
-        Transform a 3D point from camera frame to robot frame.
-
-        Args:
-            point_cam: 3D point in camera frame
-
-        Returns:
-            np.ndarray (3,): 3D point in robot frame
-        """
-        return self._cam_to_robot_rotation @ point_cam + self._cam_to_robot_translation
+    def _camera_to_robot_frame(self, point_cam: np.ndarray, cam: CameraState) -> np.ndarray:
+        """Transform a 3D point from camera frame to robot frame."""
+        return cam.cam_to_robot_rotation @ point_cam + cam.cam_to_robot_translation
 
     def get_backprojected_palm_position(
-        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int
+        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int,
+        cam: CameraState
     ) -> np.ndarray:
         """
         Backproject 5 palm landmarks using depth, average valid ones.
-
-        Args:
-            landmarks: MediaPipe hand landmarks
-            depth_image: Aligned depth image (uint16, mm)
-            img_w: Image width
-            img_h: Image height
 
         Returns:
             np.ndarray (3,) in robot frame, or None if all depths invalid
@@ -402,8 +474,8 @@ class MediaPipeHandTracker(Node):
 
             depth_m = self._sample_depth_patch(depth_image, u, v)
             if depth_m > 0.0:
-                point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m)
-                point_robot = self._camera_to_robot_frame(point_cam)
+                point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m, cam)
+                point_robot = self._camera_to_robot_frame(point_cam, cam)
                 valid_robot_points.append(point_robot)
 
         if len(valid_robot_points) == 0:
@@ -412,7 +484,8 @@ class MediaPipeHandTracker(Node):
         return np.mean(valid_robot_points, axis=0)
 
     def get_hand_yaw_depth(
-        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int
+        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int,
+        cam: CameraState
     ):
         """
         Compute hand yaw angle from backprojected wrist and middle_mcp landmarks.
@@ -428,11 +501,18 @@ class MediaPipeHandTracker(Node):
             depth_m = self._sample_depth_patch(depth_image, u, v)
             if depth_m <= 0.0:
                 return None
-            point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m)
-            points.append(self._camera_to_robot_frame(point_cam))
+            point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m, cam)
+            points.append(self._camera_to_robot_frame(point_cam, cam))
 
         forward = points[1] - points[0]  # wrist → middle_mcp
         return math.atan2(forward[1], forward[0])
+
+    def _get_first_hand(self, results):
+        """Return landmarks for the first detected hand, or None."""
+        if (results.multi_hand_landmarks is not None and
+            len(results.multi_hand_landmarks) > 0):
+            return results.multi_hand_landmarks[0].landmark
+        return None
 
     def get_hand_yaw_pixels(self, landmarks):
         """
@@ -446,13 +526,10 @@ class MediaPipeHandTracker(Node):
         return math.atan2(dx, dy)
 
     def publish_landmarks_3d(
-        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int
+        self, landmarks, depth_image: np.ndarray, img_w: int, img_h: int,
+        cam: CameraState
     ):
-        """
-        Backproject all 21 hand landmarks to robot frame and publish.
-
-        For landmarks with invalid depth, uses the nearest valid depth or skips.
-        """
+        """Backproject all 21 hand landmarks to robot frame and publish."""
         robot_landmarks = []
 
         for lm in landmarks:
@@ -463,13 +540,12 @@ class MediaPipeHandTracker(Node):
 
             depth_m = self._sample_depth_patch(depth_image, u, v)
             if depth_m > 0.0:
-                point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m)
-                point_robot = self._camera_to_robot_frame(point_cam)
+                point_cam = self._backproject_to_camera_frame(float(u), float(v), depth_m, cam)
+                point_robot = self._camera_to_robot_frame(point_cam, cam)
                 robot_landmarks.extend([float(point_robot[0]), float(point_robot[1]), float(point_robot[2])])
             else:
-                # Fallback: use a default depth of 0.5m for visualization continuity
-                point_cam = self._backproject_to_camera_frame(float(u), float(v), 0.5)
-                point_robot = self._camera_to_robot_frame(point_cam)
+                point_cam = self._backproject_to_camera_frame(float(u), float(v), 0.5, cam)
+                point_robot = self._camera_to_robot_frame(point_cam, cam)
                 robot_landmarks.extend([float(point_robot[0]), float(point_robot[1]), float(point_robot[2])])
 
         msg = Float32MultiArray()
@@ -482,88 +558,142 @@ class MediaPipeHandTracker(Node):
 
         self.landmarks_pub.publish(msg)
 
-    def synced_image_callback(self, color_msg: Image, depth_msg: Image):
+    def _synced_callback(self, color_msg: Image, depth_msg: Image,
+                          cam: CameraState, hands_detector):
         """
-        Synchronized color + depth callback. Runs MediaPipe on color,
-        backprojects landmarks using depth, publishes in robot frame.
+        Synchronized color + depth callback for a single camera.
+        Runs MediaPipe, backprojects, stores result in cam state, then fuses.
         """
-        if not self._intrinsics_received:
+        if not cam.intrinsics_received:
             return
 
-        self._sync_count += 1
-        if self._sync_count == 1:
-            self.get_logger().info('First synced color+depth frame received — depth mode active')
+        cam.sync_count += 1
+        if cam.sync_count == 1:
+            self.get_logger().info(f'{cam.name} camera: first synced color+depth frame — depth mode active')
 
         try:
-            # Convert raw color image (RGB8 from realsense) to BGR then RGB for MediaPipe
             rgb_image = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='rgb8')
-
-            # Convert depth image (16UC1, values in mm)
             depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
             img_h, img_w = rgb_image.shape[:2]
 
-            # Run MediaPipe hand detection
-            results = self.hands.process(rgb_image)
+            results = hands_detector.process(rgb_image)
 
-            tracking_active = (results.multi_hand_landmarks is not None and
-                              len(results.multi_hand_landmarks) > 0)
+            landmarks = self._get_first_hand(results)
+            detected = landmarks is not None
 
-            # Publish tracking status
-            status_msg = Bool()
-            status_msg.data = tracking_active
-            self.tracking_active_pub.publish(status_msg)
+            if detected:
 
-            if tracking_active:
-                landmarks = results.multi_hand_landmarks[0].landmark
-
-                # Compute hand yaw from depth
-                raw_yaw = self.get_hand_yaw_depth(
-                    landmarks, depth_image, img_w, img_h
-                )
+                # Compute yaw
+                raw_yaw = self.get_hand_yaw_depth(landmarks, depth_image, img_w, img_h, cam)
                 if raw_yaw is not None:
-                    yaw = self._yaw_filter.filter(np.array([raw_yaw]))[0]
+                    yaw = cam.yaw_filter.filter(np.array([raw_yaw]))[0]
                 else:
-                    # Keep last filtered value, or 0 if no previous
-                    yaw = self._yaw_filter.value[0] if self._yaw_filter.value is not None else 0.0
+                    yaw = cam.yaw_filter.value[0] if cam.yaw_filter.value is not None else 0.0
 
-                # Attempt backprojected palm position
+                # Compute position
                 palm_robot = self.get_backprojected_palm_position(
-                    landmarks, depth_image, img_w, img_h
+                    landmarks, depth_image, img_w, img_h, cam
                 )
 
                 if palm_robot is not None:
-                    # Apply low-pass filter
-                    palm_robot = self._depth_position_filter.filter(palm_robot)
-                    self.publish_hand_pose(palm_robot, color_msg.header.stamp, yaw)
+                    palm_robot = cam.position_filter.filter(palm_robot)
+                    cam.latest_position = palm_robot
+                    cam.latest_yaw = yaw
+                    cam.latest_time = time.monotonic()
+                    cam.latest_landmarks = landmarks
                 else:
-                    # Fallback to MediaPipe normalized coordinates
+                    # Depth fallback — use MediaPipe normalized coords
                     action = self.transformer.landmarks_to_action(landmarks)
-                    self.publish_hand_pose(action['position'], color_msg.header.stamp, yaw)
+                    cam.latest_position = action['position']
+                    cam.latest_yaw = yaw
+                    cam.latest_time = time.monotonic()
+                    cam.latest_landmarks = landmarks
+            else:
+                # No hand detected by this camera
+                cam.latest_position = None
+                cam.latest_yaw = None
+                cam.latest_landmarks = None
 
-                # Publish gripper from pinch gesture (always uses MediaPipe landmarks)
-                gripper = self.transformer.get_gripper_from_pinch(landmarks)
+            # Fuse results from all cameras and publish
+            self._fuse_and_publish(color_msg.header.stamp, depth_image, img_w, img_h)
+
+        except Exception as e:
+            self.get_logger().error(f'Error in {cam.name} synced callback: {e}')
+
+    def _fuse_and_publish(self, stamp, depth_image=None, img_w=0, img_h=0):
+        """Fuse results from head (and optionally front) cameras and publish."""
+        now = time.monotonic()
+
+        # Collect valid (non-stale) results
+        positions = []
+        yaws = []
+        primary_cam = None  # Camera used for gripper/landmarks
+
+        for cam in [self._head, self._front]:
+            if cam is None:
+                continue
+            if (cam.latest_position is not None and
+                cam.latest_time is not None and
+                (now - cam.latest_time) < FUSION_STALENESS_S):
+                positions.append(cam.latest_position)
+                yaws.append(cam.latest_yaw)
+                if primary_cam is None:
+                    primary_cam = cam  # Head is checked first, so it's preferred
+
+        tracking_active = len(positions) > 0
+
+        # Publish tracking status
+        status_msg = Bool()
+        status_msg.data = tracking_active
+        self.tracking_active_pub.publish(status_msg)
+
+        if tracking_active:
+            # Average positions and yaw from available cameras
+            fused_position = np.mean(positions, axis=0)
+            fused_yaw = np.mean(yaws)
+
+            # Apply fused filter
+            fused_position = self._fused_position_filter.filter(fused_position)
+            fused_yaw = self._fused_yaw_filter.filter(np.array([fused_yaw]))[0]
+
+            self.publish_hand_pose(fused_position, stamp, fused_yaw)
+
+            # Publish gripper from primary camera's landmarks
+            if primary_cam is not None and primary_cam.latest_landmarks is not None:
+                gripper = self.transformer.get_gripper_from_pinch(primary_cam.latest_landmarks)
                 gripper_msg = Float32()
                 gripper_msg.data = gripper
                 self.gripper_cmd_pub.publish(gripper_msg)
 
-                # Publish 3D landmarks
-                self.publish_landmarks_3d(landmarks, depth_image, img_w, img_h)
+            # Publish 3D landmarks from head camera only
+            if (self._head.latest_landmarks is not None and depth_image is not None and
+                self._head.latest_time is not None and
+                (now - self._head.latest_time) < FUSION_STALENESS_S):
+                self.publish_landmarks_3d(
+                    self._head.latest_landmarks, depth_image, img_w, img_h, self._head
+                )
 
-                if not self._last_tracking_active:
-                    self.get_logger().info('Hand tracking started (depth mode)')
+            if not self._last_tracking_active:
+                sources = [c.name for c in [self._head, self._front]
+                          if c is not None and c.latest_position is not None
+                          and c.latest_time is not None
+                          and (now - c.latest_time) < FUSION_STALENESS_S]
+                self.get_logger().info(f'Hand tracking started (depth, cameras: {sources})')
 
-            else:
-                if self._last_tracking_active:
-                    self.get_logger().info('Hand tracking lost')
-                    self.transformer.reset()
-                    self._depth_position_filter.reset()
-                    self._yaw_filter.reset()
+        else:
+            if self._last_tracking_active:
+                self.get_logger().info('Hand tracking lost')
+                self.transformer.reset()
+                self._fused_position_filter.reset()
+                self._fused_yaw_filter.reset()
+                self._head.position_filter.reset()
+                self._head.yaw_filter.reset()
+                if self._front is not None:
+                    self._front.position_filter.reset()
+                    self._front.yaw_filter.reset()
 
-            self._last_tracking_active = tracking_active
-
-        except Exception as e:
-            self.get_logger().error(f'Error in synced image callback: {e}')
+        self._last_tracking_active = tracking_active
 
     def image_callback(self, msg: Image):
         """
@@ -575,11 +705,11 @@ class MediaPipeHandTracker(Node):
             rgb_image = self._bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
 
             # Run MediaPipe hand detection
-            results = self.hands.process(rgb_image)
+            results = self._hands_head.process(rgb_image)
 
-            # Check if hand detected
-            tracking_active = (results.multi_hand_landmarks is not None and
-                              len(results.multi_hand_landmarks) > 0)
+            # Check if right hand detected
+            landmarks = self._get_first_hand(results)
+            tracking_active = landmarks is not None
 
             # Publish tracking status
             status_msg = Bool()
@@ -587,12 +717,10 @@ class MediaPipeHandTracker(Node):
             self.tracking_active_pub.publish(status_msg)
 
             if tracking_active:
-                # Get first hand landmarks
-                landmarks = results.multi_hand_landmarks[0].landmark
 
                 # Compute hand yaw from pixel coordinates
                 raw_yaw = self.get_hand_yaw_pixels(landmarks)
-                yaw = self._yaw_filter.filter(np.array([raw_yaw]))[0]
+                yaw = self._fused_yaw_filter.filter(np.array([raw_yaw]))[0]
 
                 # Transform to robot action
                 action = self.transformer.landmarks_to_action(landmarks)
@@ -614,9 +742,8 @@ class MediaPipeHandTracker(Node):
             else:
                 if self._last_tracking_active:
                     self.get_logger().info('Hand tracking lost')
-                    # Reset filters when tracking is lost
                     self.transformer.reset()
-                    self._yaw_filter.reset()
+                    self._fused_yaw_filter.reset()
 
             self._last_tracking_active = tracking_active
 
@@ -632,7 +759,7 @@ class MediaPipeHandTracker(Node):
         Orientation encodes hand yaw as a Z-rotation quaternion.
         """
         # Apply hand-to-robot yaw offset, then encode as Z-rotation quaternion
-        yaw = yaw - self._hand_yaw_offset
+        yaw = yaw + self._hand_yaw_offset
         qx, qy = 0.0, 0.0
         qz = math.sin(yaw / 2.0)
         qw = math.cos(yaw / 2.0)
@@ -715,7 +842,9 @@ class MediaPipeHandTracker(Node):
 
     def destroy_node(self):
         """Clean up MediaPipe resources."""
-        self.hands.close()
+        self._hands_head.close()
+        if self._use_front_camera:
+            self._hands_front.close()
         super().destroy_node()
 
 
