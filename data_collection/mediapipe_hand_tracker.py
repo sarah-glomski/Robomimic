@@ -87,6 +87,12 @@ class MediaPipeHandTracker(Node):
 
         self.declare_parameter('hand_yaw_offset_deg', -90.0)
 
+        # Handedness: 'right' uses the defaults above; 'left' swaps in overrides.
+        # Only yaw and fine_offset_y differ between hands (x/z are the same).
+        self.declare_parameter('handedness', 'right')
+        self.declare_parameter('left_hand_yaw_offset_deg', -90.0)
+        self.declare_parameter('left_fine_offset_y', -0.02)
+
         # Depth parameters
         self.declare_parameter('use_depth', True)
         self.declare_parameter('max_valid_depth_m', 1.5)
@@ -120,7 +126,13 @@ class MediaPipeHandTracker(Node):
         detection_conf = self.get_parameter('detection_confidence').value
         tracking_conf = self.get_parameter('tracking_confidence').value
 
-        self._hand_yaw_offset = math.radians(self.get_parameter('hand_yaw_offset_deg').value)
+        self._handedness = self.get_parameter('handedness').value
+        if self._handedness == 'left':
+            self._hand_yaw_offset = math.radians(
+                self.get_parameter('left_hand_yaw_offset_deg').value)
+        else:
+            self._hand_yaw_offset = math.radians(
+                self.get_parameter('hand_yaw_offset_deg').value)
 
         self._use_depth = self.get_parameter('use_depth').value
         self._max_valid_depth_m = self.get_parameter('max_valid_depth_m').value
@@ -139,11 +151,20 @@ class MediaPipeHandTracker(Node):
             self.get_parameter('robot_object_y').value,
             self.get_parameter('robot_object_z').value,
         ])
+        if self._handedness == 'left':
+            fine_offset_y = self.get_parameter('left_fine_offset_y').value
+        else:
+            fine_offset_y = self.get_parameter('fine_offset_y').value
+
         self._fine_offset = np.array([
             self.get_parameter('fine_offset_x').value,
-            self.get_parameter('fine_offset_y').value,
+            fine_offset_y,
             self.get_parameter('fine_offset_z').value,
         ])
+
+        self.get_logger().info(f'Handedness: {self._handedness} | '
+            f'yaw_offset={math.degrees(self._hand_yaw_offset):.1f}deg | '
+            f'fine_offset={self._fine_offset}')
 
         # Initialize MediaPipe Hands (one per camera stream for independent tracking state)
         self.mp_hands = mp.solutions.hands
