@@ -12,19 +12,21 @@ Launches:
 
 Usage:
     python3 launch_data_collection.py
+    python3 launch_data_collection.py --hand left
 
 Note: Update the RealSense serial numbers to match your cameras.
 """
 
 import sys
 import os
+import argparse
 from launch import LaunchService
 from launch import LaunchDescription
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
 
 
-def generate_launch_description():
+def generate_launch_description(handedness='right'):
     # Get the directory containing this launch file
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,7 +47,7 @@ def generate_launch_description():
 
         # MediaPipe Hand Tracker
         ExecuteProcess(
-            cmd=['python3', hand_tracker],
+            cmd=['python3', hand_tracker, '--ros-args', '-p', f'handedness:={handedness}'],
             name='mediapipe_hand_tracker',
             output='screen'
         ),
@@ -148,9 +150,16 @@ def generate_launch_description():
 
 def main(argv=sys.argv[1:]):
     """Entry point for the launch file."""
+    parser = argparse.ArgumentParser(description='Launch data collection system')
+    parser.add_argument('--hand', choices=['left', 'right'], default='right',
+                        help='Which hand to track (default: right)')
+    args, launch_argv = parser.parse_known_args(argv)
+
     print("=" * 60)
     print("MediaPipe Hand Tracking Data Collection System")
     print("=" * 60)
+    print()
+    print(f"Hand tracking: {args.hand}")
     print()
     print("IMPORTANT: Update RealSense serial numbers (front, wrist, head) in this file!")
     print("Find serial numbers with: rs-enumerate-devices | grep Serial")
@@ -168,8 +177,8 @@ def main(argv=sys.argv[1:]):
     print()
     print("=" * 60)
 
-    ld = generate_launch_description()
-    ls = LaunchService(argv=argv)
+    ld = generate_launch_description(handedness=args.hand)
+    ls = LaunchService(argv=launch_argv)
     ls.include_launch_description(ld)
     return ls.run()
 
