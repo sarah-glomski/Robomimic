@@ -44,7 +44,7 @@ class XArmHandController(Node):
         self.x_max = self.declare_parameter('workspace_x_max', 0.7).value
         self.y_min = self.declare_parameter('workspace_y_min', -0.3).value
         self.y_max = self.declare_parameter('workspace_y_max', 0.3).value
-        self.z_min = self.declare_parameter('workspace_z_min', 0.05).value
+        self.z_min = self.declare_parameter('workspace_z_min', 0.01).value
         self.z_max = self.declare_parameter('workspace_z_max', 0.4).value
 
         # EEF orientation: roll/pitch are fixed, yaw offset adds to tracked hand yaw
@@ -57,7 +57,7 @@ class XArmHandController(Node):
         self.yaw_dev_max_deg = self.declare_parameter('yaw_dev_max_deg', 360.0).value
 
         # TCP offset: vertical offset from flange to gripper contact point (mm)
-        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 0.0).value
+        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 172.0).value
 
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 
@@ -358,7 +358,7 @@ class XArmHandController(Node):
 
                 # Home position (in mm and degrees)
                 code = self.arm.set_position(
-                    x=259.1, y=2.9, z=258.1,
+                    x=259.1, y=2.9, z=86.1,
                     roll=-179.5, pitch=0.3, yaw=180.0,
                     speed=100, is_radian=False, wait=True
                 )

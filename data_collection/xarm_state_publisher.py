@@ -27,8 +27,9 @@ class XArmStatePublisher(Node):
     def __init__(self):
         super().__init__('xarm_state_publisher')
 
-        # Declare parameter for xarm IP address
+        # Declare parameters
         self.ip = self.declare_parameter('xarm_ip', '192.168.1.219').value
+        self.tcp_offset_z = self.declare_parameter('tcp_offset_z', 172.0).value
         self.get_logger().info(f'Connecting to xArm at IP: {self.ip}')
 
         # Initialize XArm for state reading only
@@ -52,6 +53,7 @@ class XArmStatePublisher(Node):
         self.arm.clean_error()
         self.arm.clean_warn()
         self.arm.motion_enable(enable=True)
+        self.arm.set_tcp_offset([0, 0, self.tcp_offset_z, 0, 0, 0])
         time.sleep(1)
         self.get_logger().info('XArm connection established for state publishing')
 
