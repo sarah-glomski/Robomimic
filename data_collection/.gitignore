@@ -1,2 +1,4 @@
 data_collection/demo_data/
 demo_data/
+data_collection/output.zarr/
+output.zarr/

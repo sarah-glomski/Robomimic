@@ -358,8 +358,8 @@ class XArmHandController(Node):
 
                 # Home position (in mm and degrees)
                 code = self.arm.set_position(
-                    x=200.0, y=0.0, z=250.0,
-                    roll=180.0, pitch=0.0, yaw=180.0,
+                    x=259.1, y=2.9, z=258.1,
+                    roll=-179.5, pitch=0.3, yaw=180.0,
                     speed=100, is_radian=False, wait=True
                 )
 
