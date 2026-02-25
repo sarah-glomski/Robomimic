@@ -1,2 +1,4 @@
 data_collection/demo_data/
 *.hdf5
+training/data/
+
