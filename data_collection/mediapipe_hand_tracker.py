@@ -111,7 +111,7 @@ class MediaPipeHandTracker(Node):
         self.declare_parameter('robot_object_z', 0.0)
 
         # Final position offset for fine-tuning hand-to-gripper alignment (meters)
-        self.declare_parameter('fine_offset_x', 0.0)
+        self.declare_parameter('fine_offset_x', 0.02)
         self.declare_parameter('fine_offset_y', 0.02)
         # use 0 for full gripper height, -0.092 for grasping from top
         self.declare_parameter('fine_offset_z', -0.092)
