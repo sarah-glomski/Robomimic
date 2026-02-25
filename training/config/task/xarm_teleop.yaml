@@ -1,0 +1,50 @@
+low_dim_obs_horizon: 2
+img_obs_horizon: 2
+action_horizon: 16
+
+shape_meta: &shape_meta
+  obs:
+    rs_front_rgb:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${task.img_obs_horizon}
+      down_sample_steps: 1
+    rs_wrist_rgb:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${task.img_obs_horizon}
+      down_sample_steps: 1
+    rs_head_rgb:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${task.img_obs_horizon}
+      down_sample_steps: 1
+    pose:
+      shape: [10]
+      type: low_dim
+      horizon: ${task.low_dim_obs_horizon}
+      down_sample_steps: 1
+  action:
+    shape: [10]
+    horizon: ${task.action_horizon}
+    down_sample_steps: 1
+
+name: xarm_teleop
+task_name: xarm_teleop
+dataset_path: ${oc.env:XARM_ZARR_PATH,xarm_teleop.zarr}
+
+pose_repr: &pose_repr
+  obs_pose_repr: absolute
+  action_pose_repr: absolute
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.xarm_2d_dataset.XArmImageDataset2D
+  shape_meta: *shape_meta
+  zarr_path: ${task.dataset_path}
+  seed: 42
+  val_ratio: 0.05
+  horizon: 16
+  preload: true
