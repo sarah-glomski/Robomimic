@@ -30,7 +30,7 @@ from dt_ag.rotation_transformer import RotationTransformer
 # ---------------------------------------------------------------------------
 
 DEMO_ROOT = os.path.join(os.path.dirname(__file__), "..", "data_collection", "demo_data")
-COLLECTIONS = ["Collection2", "Collection3"]
+COLLECTIONS = ["Collection4", "Collection5", "Collection6", "Collection7"]
 IMG_SIZE = 224  # ViT input size
 CAMERA_KEYS = ["rs_front", "rs_wrist", "rs_head"]
 
