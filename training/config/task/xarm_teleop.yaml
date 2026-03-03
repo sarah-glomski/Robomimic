@@ -47,4 +47,4 @@ dataset:
   seed: 42
   val_ratio: 0.05
   horizon: 16
-  preload: true
+  preload: false
