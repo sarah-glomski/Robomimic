@@ -31,7 +31,9 @@ from dt_ag.rotation_transformer import RotationTransformer
 
 DEMO_ROOT = os.path.join(os.path.dirname(__file__), "..", "data_collection", "demo_data")
 # For baseline dataset
-COLLECTIONS = ["Baseline"]
+# COLLECTIONS = ["Baseline"]
+# For mirrored dataset
+COLLECTIONS = ["Mirrored"]
 # For aligned dataset
 # COLLECTIONS = ["Collection4", "Collection5", "Collection6", "Collection7"]
 # For augmented dataset
