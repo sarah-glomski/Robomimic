@@ -183,6 +183,42 @@ def resample_nearest(data: np.ndarray, target_length: int) -> np.ndarray:
     indices = np.round(np.linspace(0, source_length - 1, target_length)).astype(int)
     return data[indices]
 
+# ---------------------------------------------------------------------------
+# Human mirroring
+# ---------------------------------------------------------------------------
+
+def apply_human_mirror(images: np.ndarray, crop_x: int, mirror_width: int) -> np.ndarray:
+    """
+    Mirror the human-side region near the seam.
+
+    The region [crop_x - mirror_width : crop_x] is flipped horizontally
+    and written back to itself. Only affects the human side.
+
+    Args:
+        images: (T, 3, H, W) uint8
+        crop_x: seam column
+        mirror_width: width of mirrored region (pixels)
+
+    Returns:
+        Modified copy of images
+    """
+    if mirror_width <= 0:
+        return images
+
+    T, C, H, W = images.shape
+    out = images.copy()
+
+    x_start = max(0, crop_x - mirror_width)
+    x_end = crop_x
+
+    region = images[:, :, :, x_start:x_end]
+
+    # horizontal flip (last axis)
+    mirrored = region[:, :, :, ::-1]
+
+    out[:, :, :, x_start:x_end] = mirrored
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Image splicing
@@ -240,6 +276,7 @@ def create_augmented_episode(
     front_crop_x: int,
     head_crop_x: int,
     blend_width: int = 0,
+    mirror_width: int = 0,
 ) -> dict:
     """Combine robot data from one episode with human visuals from another.
 
@@ -252,6 +289,10 @@ def create_augmented_episode(
     # Resample human data to match robot length
     human_front = resample_nearest(human_ep["images/rs_front"], T_robot)
     human_head = resample_nearest(human_ep["images/rs_head"], T_robot)
+
+    human_front = apply_human_mirror(human_front, front_crop_x, mirror_width)
+    human_head = apply_human_mirror(human_head, head_crop_x, mirror_width)
+
     human_hand_pose = resample_nearest(human_ep["hand/pose"], T_robot)
 
     # Splice front and head cameras
@@ -498,6 +539,8 @@ def main():
                         help="Output directory for augmented HDF5 files")
     parser.add_argument("--blend-width", type=int, default=0,
                         help="Pixel blending zone at seam (default: 0 = hard cut)")
+    parser.add_argument("--mirror-width", type=int, default=0,
+                        help="Mirror the human side within this width left of the seam (0 = disabled)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for pair sampling (default: 42)")
     parser.add_argument("--baseline", action="store_true",
@@ -706,6 +749,7 @@ def main():
                 robot_ep, human_ep,
                 args.front_crop_x, args.head_crop_x,
                 args.blend_width,
+                args.mirror_width,
             )
 
             # Save
