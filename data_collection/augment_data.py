@@ -184,43 +184,6 @@ def resample_nearest(data: np.ndarray, target_length: int) -> np.ndarray:
     return data[indices]
 
 # ---------------------------------------------------------------------------
-# Human mirroring
-# ---------------------------------------------------------------------------
-
-def apply_human_mirror(images: np.ndarray, crop_x: int, mirror_width: int) -> np.ndarray:
-    """
-    Mirror the human-side region near the seam.
-
-    The region [crop_x - mirror_width : crop_x] is flipped horizontally
-    and written back to itself. Only affects the human side.
-
-    Args:
-        images: (T, 3, H, W) uint8
-        crop_x: seam column
-        mirror_width: width of mirrored region (pixels)
-
-    Returns:
-        Modified copy of images
-    """
-    if mirror_width <= 0:
-        return images
-
-    T, C, H, W = images.shape
-    out = images.copy()
-
-    x_start = max(0, crop_x - mirror_width)
-    x_end = crop_x
-
-    region = images[:, :, :, x_start:x_end]
-
-    # horizontal flip (last axis)
-    mirrored = region[:, :, :, ::-1]
-
-    out[:, :, :, x_start:x_end] = mirrored
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Image splicing
 # ---------------------------------------------------------------------------
 
@@ -276,7 +239,6 @@ def create_augmented_episode(
     front_crop_x: int,
     head_crop_x: int,
     blend_width: int = 0,
-    mirror_width: int = 0,
 ) -> dict:
     """Combine robot data from one episode with human visuals from another.
 
@@ -289,10 +251,6 @@ def create_augmented_episode(
     # Resample human data to match robot length
     human_front = resample_nearest(human_ep["images/rs_front"], T_robot)
     human_head = resample_nearest(human_ep["images/rs_head"], T_robot)
-
-    human_front = apply_human_mirror(human_front, front_crop_x, mirror_width)
-    human_head = apply_human_mirror(human_head, head_crop_x, mirror_width)
-
     human_hand_pose = resample_nearest(human_ep["hand/pose"], T_robot)
 
     # Splice front and head cameras
@@ -360,6 +318,44 @@ def create_baseline_episode(
         "images/rs_front": spliced_front,
         "images/rs_wrist": episode["images/rs_wrist"].copy(),
         "images/rs_head": spliced_head,
+    }
+
+def create_mirror_episode(
+    episode: dict,
+    front_crop_x: int,
+    head_crop_x: int,
+    mirror_width: int,
+) -> dict:
+    """
+    Mirror the human side near the seam within mirror_width pixels.
+    Robot side and all robot state remain unchanged.
+    """
+
+    def mirror(images, crop_x):
+        T, C, H, W = images.shape
+        out = images.copy()
+
+        x_start = max(0, crop_x - mirror_width)
+        x_end = crop_x
+
+        region = images[:, :, :, x_start:x_end]
+        mirrored = region[:, :, :, ::-1]
+
+        out[:, :, :, x_start:x_end] = mirrored
+        return out
+
+    mirrored_front = mirror(episode["images/rs_front"], front_crop_x)
+    mirrored_head = mirror(episode["images/rs_head"], head_crop_x)
+
+    return {
+        "action/pose": episode["action/pose"].copy(),
+        "action/gripper": episode["action/gripper"].copy(),
+        "observation/pose": episode["observation/pose"].copy(),
+        "observation/gripper": episode["observation/gripper"].copy(),
+        "hand/pose": episode["hand/pose"].copy(),
+        "images/rs_front": mirrored_front,
+        "images/rs_wrist": episode["images/rs_wrist"].copy(),
+        "images/rs_head": mirrored_head,
     }
 
 
@@ -545,6 +541,8 @@ def main():
                         help="Random seed for pair sampling (default: 42)")
     parser.add_argument("--baseline", action="store_true",
                         help="Generate baseline episodes with human side frozen at frame 0")
+    parser.add_argument("--mirror", action="store_true",
+                        help="Mirror the human side of each episode individually")
     parser.add_argument("--preview", action="store_true",
                         help="Show sample frames with crop lines (visual check)")
     parser.add_argument("--dry-run", action="store_true",
@@ -599,6 +597,11 @@ def main():
                 print(f"Error: {flag} needs at least 2 collections for cross-collection pairing, "
                       f"got {len(group_colls)}")
                 sys.exit(1)
+
+    # Validate that a width is given if mirroring 
+    if args.mirror and args.mirror_width <= 0:
+        print("Error: --mirror requires --mirror-width > 0")
+        sys.exit(1)
 
     # -----------------------------------------------------------------------
     # Baseline mode: freeze human side at frame 0 for each episode
@@ -668,6 +671,72 @@ def main():
             del episode, baseline_ep
 
         print(f"\nDone. {total} baseline episodes written to {output_dir}")
+        
+        
+    # -----------------------------------------------------------------------
+    # Mirror mode: mirror human side for each episode
+    # -----------------------------------------------------------------------
+    if args.mirror:
+
+        mirror_indices = []
+        for group_name, group_colls in [("horizontal", args.horizontal), ("vertical", args.vertical)]:
+            if group_colls is None:
+                continue
+
+            group_eps = sorted(
+                idx for idx, coll in collection_map.items() if coll in group_colls
+            )
+
+            print(f"{group_name.upper()} group: {len(group_eps)} episodes for mirroring")
+            mirror_indices.extend(group_eps)
+
+        mirror_indices = sorted(set(mirror_indices))
+
+        print(f"\nTotal mirrored episodes to generate: {len(mirror_indices)}")
+
+        if args.dry_run:
+            for i, idx in enumerate(mirror_indices):
+                ep_base = os.path.basename(os.path.dirname(episode_paths[idx]))
+                ep_file = os.path.basename(episode_paths[idx])
+                print(f"  episode_{i}.hdf5: source={ep_base}/{ep_file} (mirrored human side)")
+            return
+
+        if args.output_dir is None:
+            print("Error: --output-dir is required for mirror mode")
+            sys.exit(1)
+
+        os.makedirs(args.output_dir, exist_ok=True)
+
+        total = len(mirror_indices)
+
+        for i, idx in enumerate(mirror_indices):
+
+            print(f"[{i+1}/{total}] mirroring episode {episode_paths[idx]}")
+
+            episode = load_episode_raw(episode_paths[idx])
+
+            mirrored = create_mirror_episode(
+                episode,
+                args.front_crop_x,
+                args.head_crop_x,
+                args.mirror_width,
+            )
+
+            out_path = os.path.join(args.output_dir, f"episode_{i}.hdf5")
+
+            save_augmented_episode(
+                mirrored,
+                out_path,
+                i,
+                episode_paths[idx],
+                "mirror_human_side",
+            )
+
+            print(f"  -> {out_path}")
+
+            del episode, mirrored
+
+        print(f"\nDone. {total} mirrored episodes written to {args.output_dir}")
         return
 
     # -----------------------------------------------------------------------
@@ -749,7 +818,6 @@ def main():
                 robot_ep, human_ep,
                 args.front_crop_x, args.head_crop_x,
                 args.blend_width,
-                args.mirror_width,
             )
 
             # Save

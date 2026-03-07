@@ -31,7 +31,7 @@ shape_meta: &shape_meta
 
 name: xarm_teleop
 task_name: xarm_teleop
-dataset_path: ${oc.env:XARM_ZARR_PATH,xarm_teleop_baseline.zarr}
+dataset_path: ${oc.env:XARM_ZARR_PATH,xarm_teleop_baseline_aligned.zarr}
 
 pose_repr: &pose_repr
   obs_pose_repr: absolute
