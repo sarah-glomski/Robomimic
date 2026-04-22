@@ -1,6 +1,6 @@
 # Robomimic
 Rotation project for Sarah Glomski - training a robot to mimic a human in real-time
-Worksheet link: https://docs.google.com/spreadsheets/d/10szu_UAZG9ofzCyzFNat_vhCXXukv13KucbzM-qtKw4/edit?gid=702452610#gid=702452610
+Worksheet link: [https://docs.google.com/spreadsheets/d/10szu_UAZG9ofzCyzFNat_vhCXXukv13KucbzM-qtKw4/edit?gid=702452610#gid=702452610](https://docs.google.com/spreadsheets/d/10szu_UAZG9ofzCyzFNat_vhCXXukv13KucbzM-qtKw4/edit?usp=sharing)
 
 # Data Collection 
 Data collection pipeline is built on ROS2 backbone and was adapted from Aiden Swann's data collection repo: dt_ag-main
