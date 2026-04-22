@@ -1,5 +1,6 @@
 # Robomimic
 Rotation project for Sarah Glomski - training a robot to mimic a human in real-time
+
 Worksheet link: [https://docs.google.com/spreadsheets/d/10szu_UAZG9ofzCyzFNat_vhCXXukv13KucbzM-qtKw4/edit?gid=702452610#gid=702452610](https://docs.google.com/spreadsheets/d/10szu_UAZG9ofzCyzFNat_vhCXXukv13KucbzM-qtKw4/edit?usp=sharing)
 
 # Data Collection 
@@ -52,13 +53,15 @@ To run mirrored augmentation:	python augment_data.py \
 
 # Training 
 To run training (with debug):	python train.py --config-name=train_diffusion_unet_timm_xarm training.debug=True
+
 To run training (without debug): python train.py --config-name=train_diffusion_unet_timm_xarm
 
 # Testing (Inference) 
 To run inference:	python launch_inference.py --model /home/sarah/Robomimic/training/data/outputs/2026.02.24/16.03.25_train_diffusion_unet_timm_xarm_xarm_teleop/checkpoints/latest.ckpt
-To visualize an episode: python3 visualize_episode.py demo_data/episode_3.hdf5
-To convert to zarr: python3 hdf5_to_zarr.py demo_data/Collection1 output.zarr
 
+To visualize an episode: python3 visualize_episode.py demo_data/episode_3.hdf5
+
+To convert to zarr: python3 hdf5_to_zarr.py demo_data/Collection1 output.zarr
 
 # Tips
 - The data collection script is design to fail loudly if an error occurs, so always keep an eye on the pygame window and/or the terminal logs. If logs start coming out very quickly, something is probably wrong. Most common is the wrist camera unplugs during arm movement.
